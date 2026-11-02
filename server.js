@@ -8,7 +8,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { join } from "node:path";
 import os from "node:os";
 
 const execFileAsync = promisify(execFile);
@@ -491,6 +492,7 @@ function renderMessage(m, handles, { conversationName, maxLen } = {}) {
   const lines = [`${head} ${m.sender}: ${(body || "").replace(/\n/g, "\n    ")}${m.edited ? " (edited)" : ""}`.trimEnd()];
   if (m.reply) lines.push(`    ↳ replying to ${m.reply.who}: "${clip(m.reply.text.replace(/\s+/g, " "), 100)}"`);
   for (const a of m.attachments) lines.push(`    [${a.type}] ${a.name}${a.path ? ` — ${a.path}` : ""}`);
+  if (m.attachments.some(a => a.type.startsWith("image/"))) lines.push(`    (see the image with view_attachments(message_id="#${m.id}"))`);
   if (m.reactions.length) lines.push(`    reactions: ${m.reactions.join(", ")}`);
   return lines.join("\n");
 }
@@ -683,6 +685,55 @@ async function sendMessage({ recipient, message }) {
   return `Sent to ${contactFor(handle)?.name || handle} (${handle}), new conversation via iMessage.`;
 }
 
+// Claude reads JPEG/PNG/GIF/WebP, not HEIC or TIFF, so every image is converted to a JPEG with
+// macOS's built-in sips, capped at 1568px on the long side (the size Claude processes anyway).
+const MAX_IMAGE_EDGE = 1568;
+
+function imageAsJpeg(path, tmp, i) {
+  const out = join(tmp, `${i}.jpg`);
+  execFileSync("/usr/bin/sips", ["-s", "format", "jpeg", "-s", "formatOptions", "80", "-Z", String(MAX_IMAGE_EDGE), path, "--out", out], {
+    stdio: "ignore",
+  });
+  return readFileSync(out).toString("base64");
+}
+
+function viewAttachments({ message_id, max_images = 4 }) {
+  const id = Number(String(message_id ?? "").replace("#", ""));
+  if (!id) throw new Error('message_id is required, e.g. "#1234567" from read_conversation or search_messages');
+  const index = conversationIndex();
+  const row = db().prepare(`SELECT ${MESSAGE_COLUMNS} FROM message m JOIN chat_message_join cmj ON cmj.message_id = m.ROWID WHERE m.ROWID = ?`).get(id);
+  if (!row) throw new Error(`No message #${id}.`);
+  const [m] = hydrate([row], index.handles);
+  const where = index.byChatId.get(m.chatId)?.name || "unknown chat";
+  const header = [`#${m.id} ${fmtDate(m.when)} [${where}] ${m.sender}: ${m.content || ""}`.trimEnd()];
+  if (!m.attachments.length) return `${header[0]}
+(no attachments)`;
+
+  const images = [];
+  const tmp = mkdtempSync(join(os.tmpdir(), "imessage-mcp-"));
+  try {
+    m.attachments.forEach((a, i) => {
+      if (!a.type.startsWith("image/")) {
+        header.push(`- ${a.name} [${a.type}]: not an image${a.path ? `; file at ${a.path}` : ""}`);
+      } else if (!a.path || !existsSync(a.path)) {
+        header.push(`- ${a.name}: not downloaded on this Mac (it's in iCloud). Open the conversation in Messages to download it, then try again.`);
+      } else if (images.length >= Math.min(Number(max_images) || 4, 10)) {
+        header.push(`- ${a.name}: skipped (max_images reached)`);
+      } else {
+        try {
+          images.push({ type: "image", data: imageAsJpeg(a.path, tmp, i), mimeType: "image/jpeg" });
+          header.push(`- ${a.name}: shown below`);
+        } catch {
+          header.push(`- ${a.name} [${a.type}]: couldn't convert this image; file at ${a.path}`);
+        }
+      }
+    });
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+  return { content: [{ type: "text", text: header.join("\n") }, ...images] };
+}
+
 function normalizePhone(phone) {
   const cleaned = phone.replace(/[^0-9+]/g, "");
   if (cleaned.startsWith("+")) return cleaned;
@@ -789,6 +840,20 @@ const TOOLS = [
     run: searchContactsTool,
   },
   {
+    name: "view_attachments",
+    description: "Show the images attached to a message so you can see them (photos, screenshots, HEIC, GIF first frame). Takes a message id from read_conversation or search_messages. Non-image attachments are listed with their file paths.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message_id: { type: "string", description: 'Message id, e.g. "#1234567"' },
+        max_images: { type: "number", description: "Max images to return (default 4, max 10)" },
+      },
+      required: ["message_id"],
+    },
+    annotations: { title: "View Attachments", readOnlyHint: true, openWorldHint: false },
+    run: viewAttachments,
+  },
+  {
     name: "send_imessage",
     description: "Send a message to a person or group chat via Messages.app. The recipient must resolve to exactly one conversation (otherwise the candidates are returned and nothing is sent). A raw phone number or email with no history starts a new iMessage conversation.",
     inputSchema: {
@@ -805,7 +870,7 @@ const TOOLS = [
 ];
 
 const server = new Server(
-  { name: "imessage-mcp", version: "1.0.0" },
+  { name: "imessage-mcp", version: "1.1.0" },
   {
     capabilities: { tools: {} },
     instructions:
@@ -822,8 +887,8 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
   const tool = TOOLS.find(t => t.name === request.params.name);
   if (!tool) throw new Error(`Unknown tool: ${request.params.name}`);
   try {
-    const text = await tool.run(request.params.arguments || {});
-    return { content: [{ type: "text", text }] };
+    const result = await tool.run(request.params.arguments || {});
+    return typeof result === "string" ? { content: [{ type: "text", text: result }] } : result;
   } catch (error) {
     return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
   }
@@ -836,7 +901,9 @@ if (process.argv[2] === "--cli") {
     console.error(`Tools: ${TOOLS.map(t => t.name).join(", ")}`);
     process.exit(1);
   }
-  console.log(await tool.run(JSON.parse(process.argv[4] || "{}")));
+  const result = await tool.run(JSON.parse(process.argv[4] || "{}"));
+  if (typeof result === "string") console.log(result);
+  else for (const c of result.content) console.log(c.type === "text" ? c.text : `[${c.mimeType} image, ${Math.round(c.data.length * 0.75 / 1024)} KB]`);
 } else {
   await server.connect(new StdioServerTransport());
 }

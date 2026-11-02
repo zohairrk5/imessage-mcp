@@ -10,6 +10,7 @@ real contact name. It runs entirely on your Mac.
 > "Catch me up on the founders group chat from this week."
 > "What did Alex say about the pricing change, and when?"
 > "Find the address someone sent me last month."
+> "What was in the screenshot Sam sent in the team chat?"
 
 ## Install
 
@@ -55,6 +56,7 @@ Quit and reopen the app afterwards. Check it with `node ~/.imessage-mcp/bin/setu
 | `read_conversation` | A transcript of a DM or group chat by contact name, group name, phone, email or `chat:<id>`. Shows sender names, inline replies, reactions and attachments. Filter with `since`/`before`, or jump to the messages `around` any message |
 | `search_messages` | Searches every message, case-insensitive. Filter by conversation, sender (or `"me"`) and time range |
 | `get_unread_imessages` | Unread messages grouped by conversation |
+| `view_attachments` | Shows the photos and screenshots in a message so the assistant can actually see them. HEIC and other formats are converted automatically |
 | `search_contacts` | Contacts by name, phone (any format) or email, with their conversation if one exists |
 | `send_imessage` | Sends to a person or group chat. It only sends when the name matches exactly one recipient; otherwise it lists the candidates |
 
@@ -74,6 +76,7 @@ Claude Desktop ships an official iMessage extension from Anthropic. imessage-mcp
 | **Overview** | A flat list of unread messages | A Slack-style list of conversations with unread counts and previews |
 | **Context** | The last N messages | Time ranges, plus the messages around any search hit |
 | **Replies, reactions, unsent messages, attachments** | Not shown | Shown inline |
+| **Photos and screenshots** | Can't be seen | The assistant can view them, with HEIC converted automatically |
 | **One person across iMessage, SMS and email** | Separate threads | Merged into one conversation |
 | **Large histories** | Reads can fail once output passes 1 MB | No limit problems |
 | **Sending** | Sends to whatever string it's given | Sends only when the name matches exactly one recipient; otherwise lists the candidates |

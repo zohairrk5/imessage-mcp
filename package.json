@@ -1,6 +1,6 @@
 {
   "name": "imessage-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Slack-style iMessage context for Claude and other MCP clients: conversations, group chats, search and contact names. macOS only, local and read-only.",
   "type": "module",
   "main": "server.js",
