@@ -16,9 +16,16 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const SERVER = join(ROOT, "server.js");
 const NAME = "imessage-mcp";
 const REPO = "zohairrk5/imessage-mcp";
-const NODE = process.execPath;
 const HOME = os.homedir();
 const flags = new Set(process.argv.slice(2));
+
+const run = (cmd, args, opts = {}) => spawnSync(cmd, args, { encoding: "utf8", ...opts });
+const has = cmd => run("/usr/bin/which", [cmd]).status === 0;
+
+// Register the `node` found on PATH (e.g. /opt/homebrew/bin/node) rather than process.execPath,
+// which can be a versioned Cellar path that disappears when Homebrew upgrades Node.
+const pathNode = run("/usr/bin/which", ["node"]).stdout?.trim();
+const NODE = pathNode && existsSync(pathNode) ? pathNode : process.execPath;
 
 const green = s => `\x1b[32m${s}\x1b[0m`;
 const yellow = s => `\x1b[33m${s}\x1b[0m`;
@@ -28,8 +35,6 @@ const ok = msg => console.log(`${green("✓")} ${msg}`);
 const warn = msg => console.log(`${yellow("!")} ${msg}`);
 const fail = msg => console.log(`${red("✗")} ${msg}`);
 
-const run = (cmd, args, opts = {}) => spawnSync(cmd, args, { encoding: "utf8", ...opts });
-const has = cmd => run("/usr/bin/which", [cmd]).status === 0;
 const FDA_PANE = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
 
 function hostAppName() {
