@@ -1,0 +1,9 @@
+.git/
+.github/
+bin/
+install.sh
+AGENTS.md
+CLAUDE.md
+.gitignore
+*.mcpb
+.DS_Store

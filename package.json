@@ -1,0 +1,42 @@
+{
+  "name": "imessage-mcp",
+  "version": "1.0.0",
+  "description": "Slack-style iMessage context for Claude and other MCP clients: conversations, group chats, search and contact names. macOS only, local and read-only.",
+  "type": "module",
+  "main": "server.js",
+  "bin": {
+    "imessage-mcp": "server.js",
+    "imessage-mcp-setup": "bin/setup.js"
+  },
+  "scripts": {
+    "setup": "node bin/setup.js",
+    "check": "node bin/setup.js --check",
+    "pack:mcpb": "npx -y @anthropic-ai/mcpb pack . imessage-mcp.mcpb"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin"
+  ],
+  "keywords": [
+    "imessage",
+    "mcp",
+    "claude",
+    "messages",
+    "sms",
+    "macos",
+    "model-context-protocol"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zohairrk5/imessage-mcp.git"
+  },
+  "homepage": "https://github.com/zohairrk5/imessage-mcp",
+  "bugs": "https://github.com/zohairrk5/imessage-mcp/issues",
+  "author": "Zohair Khan",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2"
+  }
+}
