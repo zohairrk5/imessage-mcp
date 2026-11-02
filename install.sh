@@ -22,7 +22,9 @@ fi
 
 if [ -d "$DIR/.git" ]; then
   echo "Updating $DIR"
-  git -C "$DIR" pull --ff-only --quiet
+  # The install dir is managed by this script, so always match the published main branch.
+  git -C "$DIR" fetch --quiet origin main
+  git -C "$DIR" reset --hard --quiet origin/main
 else
   echo "Downloading imessage-mcp to $DIR"
   git clone --quiet --depth 1 "$REPO_URL" "$DIR"
