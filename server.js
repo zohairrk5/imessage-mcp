@@ -8,8 +8,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { constants as fsConstants, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { basename, extname, join, resolve } from "node:path";
 import os from "node:os";
 
 const execFileAsync = promisify(execFile);
@@ -394,6 +394,35 @@ const MESSAGE_COLUMNS = `
 
 const REACTIONS = { 2000: "❤️", 2001: "👍", 2002: "👎", 2003: "😂", 2004: "‼️", 2005: "❓", 2007: "sticker" };
 
+// Link previews (.pluginPayloadAttachment) and stickers are Messages internals, not files people sent.
+const ATTACHMENT_COLUMNS = "a.filename, a.mime_type mime, a.transfer_name name, a.total_bytes size";
+const REAL_ATTACHMENT = "ifnull(a.transfer_name, ifnull(a.filename, '')) NOT LIKE '%.pluginPayloadAttachment' AND ifnull(a.is_sticker, 0) = 0";
+
+const TEXT_EXTS = new Set("txt md markdown csv tsv json log yaml yml toml ini xml vcf ics tex sql sh py js ts jsx tsx css swift java kt c cc cpp h go rs rb php".split(" "));
+const TEXTUTIL_EXTS = new Set("doc docx rtf rtfd html htm odt wordml webarchive".split(" ")); // formats macOS textutil reads
+
+function attachmentFromRow(a) {
+  const name = a.name || basename(a.filename || "") || "attachment";
+  const att = { type: a.mime || "file", name, path: a.filename ? a.filename.replace(/^~/, HOME) : null, size: Number(a.size) || 0 };
+  att.kind = attachmentKind(att);
+  return att;
+}
+
+function attachmentKind({ type, name }) {
+  const ext = extname(name).slice(1).toLowerCase();
+  if (type.startsWith("image/")) return "image";
+  if (type.startsWith("video/")) return "video";
+  if (type.startsWith("audio/") || ext === "caf") return "audio";
+  if (type === "application/pdf" || ext === "pdf") return "pdf";
+  if (TEXTUTIL_EXTS.has(ext)) return "document";
+  if (type.startsWith("text/") || TEXT_EXTS.has(ext)) return "text";
+  return "other";
+}
+
+const OPENABLE = new Set(["image", "pdf", "document", "text"]);
+const isLocal = a => Boolean(a.path && existsSync(a.path));
+const fmtSize = n => (!n ? "" : n < 1024 ? `${n} B` : n < 1048576 ? `${Math.round(n / 1024)} KB` : `${(n / 1048576).toFixed(1)} MB`);
+
 function senderName(row, handles) {
   if (row.fromMe) return "Me";
   return displayHandle(handles.get(row.hid));
@@ -405,17 +434,12 @@ function hydrate(rows, handles) {
 
   const attachments = new Map();
   const attRows = db().prepare(`
-    SELECT maj.message_id mid, a.filename, a.mime_type mime, a.transfer_name name
+    SELECT maj.message_id mid, ${ATTACHMENT_COLUMNS}
     FROM message_attachment_join maj JOIN attachment a ON a.ROWID = maj.attachment_id
-    WHERE maj.message_id IN (${placeholders(ids)})`).all(...ids);
+    WHERE maj.message_id IN (${placeholders(ids)}) AND ${REAL_ATTACHMENT}`).all(...ids);
   for (const a of attRows) {
-    if ((a.name || a.filename || "").endsWith(".pluginPayloadAttachment")) continue; // link-preview internals
     if (!attachments.has(a.mid)) attachments.set(a.mid, []);
-    attachments.get(a.mid).push({
-      type: a.mime || "file",
-      name: a.name || (a.filename || "").split("/").pop(),
-      path: a.filename ? a.filename.replace(/^~/, HOME) : null,
-    });
+    attachments.get(a.mid).push(attachmentFromRow(a));
   }
 
   // Tapbacks on these messages, folded so removed reactions disappear.
@@ -492,7 +516,7 @@ function renderMessage(m, handles, { conversationName, maxLen } = {}) {
   const lines = [`${head} ${m.sender}: ${(body || "").replace(/\n/g, "\n    ")}${m.edited ? " (edited)" : ""}`.trimEnd()];
   if (m.reply) lines.push(`    ↳ replying to ${m.reply.who}: "${clip(m.reply.text.replace(/\s+/g, " "), 100)}"`);
   for (const a of m.attachments) lines.push(`    [${a.type}] ${a.name}${a.path ? ` — ${a.path}` : ""}`);
-  if (m.attachments.some(a => a.type.startsWith("image/"))) lines.push(`    (see the image with view_attachments(message_id="#${m.id}"))`);
+  if (m.attachments.some(a => OPENABLE.has(a.kind))) lines.push(`    (open with view_attachments(message_id="#${m.id}"))`);
   if (m.reactions.length) lines.push(`    reactions: ${m.reactions.join(", ")}`);
   return lines.join("\n");
 }
@@ -697,41 +721,156 @@ function imageAsJpeg(path, tmp, i) {
   return readFileSync(out).toString("base64");
 }
 
-function viewAttachments({ message_id, max_images = 4 }) {
+// Text comes out of PDFs through PDFKit (via JavaScript for Automation) and out of Word/RTF/HTML
+// through textutil, both built into macOS, so nothing extra needs installing.
+const MAX_READ_BYTES = 50 * 1048576;
+
+function extractText(a) {
+  if (a.kind === "text") {
+    const text = readFileSync(a.path, "utf8");
+    if (text.includes("\u0000")) throw new Error("binary file");
+    return text;
+  }
+  if (a.kind === "document") {
+    return execFileSync("/usr/bin/textutil", ["-convert", "txt", "-stdout", a.path], { encoding: "utf8", maxBuffer: 64 * 1048576, timeout: 30000, stdio: ["ignore", "pipe", "ignore"] });
+  }
+  return execFileSync("/usr/bin/osascript", [
+    "-l", "JavaScript", "-e",
+    'ObjC.import("PDFKit"); function run(argv) { const d = $.PDFDocument.alloc.initWithURL($.NSURL.fileURLWithPath(argv[0])); ' +
+      'if (!d || d.isNil()) throw new Error("not a readable PDF"); const s = d.string; return s && !s.isNil() ? ObjC.unwrap(s) : ""; }',
+    a.path,
+  ], { encoding: "utf8", maxBuffer: 64 * 1048576, timeout: 30000, stdio: ["ignore", "pipe", "ignore"] });
+}
+
+function messageWithAttachments(message_id) {
   const id = Number(String(message_id ?? "").replace("#", ""));
-  if (!id) throw new Error('message_id is required, e.g. "#1234567" from read_conversation or search_messages');
+  if (!id) throw new Error('message_id is required, e.g. "#1234567" from read_conversation, search_messages or list_attachments');
   const index = conversationIndex();
   const row = db().prepare(`SELECT ${MESSAGE_COLUMNS} FROM message m JOIN chat_message_join cmj ON cmj.message_id = m.ROWID WHERE m.ROWID = ?`).get(id);
   if (!row) throw new Error(`No message #${id}.`);
   const [m] = hydrate([row], index.handles);
   const where = index.byChatId.get(m.chatId)?.name || "unknown chat";
-  const header = [`#${m.id} ${fmtDate(m.when)} [${where}] ${m.sender}: ${m.content || ""}`.trimEnd()];
-  if (!m.attachments.length) return `${header[0]}
-(no attachments)`;
+  return { m, header: `#${m.id} ${fmtDate(m.when)} [${where}] ${m.sender}: ${m.content || ""}`.trimEnd() };
+}
 
+const NOT_DOWNLOADED = "not downloaded on this Mac (it's in iCloud). Open the conversation in Messages to download it, then try again.";
+
+function viewAttachments({ message_id, max_images = 4, max_chars = 20000 }) {
+  const { m, header } = messageWithAttachments(message_id);
+  if (!m.attachments.length) return `${header}\n(no attachments)`;
+  const imageCap = Math.min(Number(max_images) || 4, 10);
+  const charCap = Math.min(Number(max_chars) || 20000, 100000);
+
+  const lines = [header];
   const images = [];
+  const texts = [];
   const tmp = mkdtempSync(join(os.tmpdir(), "imessage-mcp-"));
+  const addImage = (a, i, label) => {
+    if (images.length >= imageCap) return lines.push(`- ${a.name}: skipped (max_images reached)`);
+    images.push({ type: "image", data: imageAsJpeg(a.path, tmp, i), mimeType: "image/jpeg" });
+    lines.push(`- ${a.name}: ${label}`);
+  };
   try {
     m.attachments.forEach((a, i) => {
-      if (!a.type.startsWith("image/")) {
-        header.push(`- ${a.name} [${a.type}]: not an image${a.path ? `; file at ${a.path}` : ""}`);
-      } else if (!a.path || !existsSync(a.path)) {
-        header.push(`- ${a.name}: not downloaded on this Mac (it's in iCloud). Open the conversation in Messages to download it, then try again.`);
-      } else if (images.length >= Math.min(Number(max_images) || 4, 10)) {
-        header.push(`- ${a.name}: skipped (max_images reached)`);
-      } else {
-        try {
-          images.push({ type: "image", data: imageAsJpeg(a.path, tmp, i), mimeType: "image/jpeg" });
-          header.push(`- ${a.name}: shown below`);
-        } catch {
-          header.push(`- ${a.name} [${a.type}]: couldn't convert this image; file at ${a.path}`);
-        }
+      const label = `${a.name} [${a.type}${a.size ? `, ${fmtSize(a.size)}` : ""}]`;
+      if (!isLocal(a)) return lines.push(`- ${label}: ${NOT_DOWNLOADED}`);
+      if (!OPENABLE.has(a.kind)) return lines.push(`- ${label}: ${a.kind} files can't be opened here; file at ${a.path} (save_attachment copies it out)`);
+      try {
+        if (a.kind === "image") return addImage(a, i, "shown below");
+        if (statSync(a.path).size > MAX_READ_BYTES) return lines.push(`- ${label}: too large to read; file at ${a.path}`);
+        const text = extractText(a).replace(/\r\n?/g, "\n").trim();
+        // A PDF with no text layer is a scan or a picture: show its first page instead.
+        if (!text && a.kind === "pdf") return addImage(a, i, "no text layer (scanned?), first page shown below");
+        const cut = text.length > charCap;
+        lines.push(`- ${label}: ${text ? `text below${cut ? ` (first ${charCap} of ${text.length} characters; raise max_chars for more)` : ""}` : "empty"}`);
+        if (text) texts.push(`===== ${a.name} =====\n${cut ? text.slice(0, charCap) + "\n[…truncated]" : text}`);
+      } catch {
+        lines.push(`- ${label}: couldn't read this file; it's at ${a.path}`);
       }
     });
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
-  return { content: [{ type: "text", text: header.join("\n") }, ...images] };
+  return { content: [{ type: "text", text: [lines.join("\n"), ...texts].join("\n\n") }, ...images] };
+}
+
+// Copies keep the original file name; an existing file is never overwritten ("name (1).pdf" instead).
+function saveAttachment({ message_id, destination = "~/Downloads", attachment }) {
+  const { m, header } = messageWithAttachments(message_id);
+  if (!m.attachments.length) return `${header}\n(no attachments)`;
+  const dir = resolve(HOME, String(destination || "~/Downloads").trim().replace(/^~(?=\/|$)/, HOME));
+  let picked = m.attachments;
+  if (attachment != null && attachment !== "") {
+    const n = Number(attachment);
+    picked = Number.isInteger(n) && n >= 1 ? [m.attachments[n - 1]].filter(Boolean)
+      : m.attachments.filter(a => a.name.toLowerCase().includes(String(attachment).toLowerCase()));
+    if (!picked.length) throw new Error(`No attachment "${attachment}" on #${m.id}. It has: ${m.attachments.map((a, i) => `${i + 1}. ${a.name}`).join(", ")}`);
+  }
+  mkdirSync(dir, { recursive: true });
+  const lines = [header];
+  for (const a of picked) {
+    if (!isLocal(a)) { lines.push(`- ${a.name}: ${NOT_DOWNLOADED}`); continue; }
+    const ext = extname(a.name);
+    const stem = basename(a.name, ext).replace(/[/:]/g, "-") || "attachment";
+    for (let k = 0; ; k++) {
+      const target = join(dir, k ? `${stem} (${k})${ext}` : `${stem}${ext}`);
+      try {
+        copyFileSync(a.path, target, fsConstants.COPYFILE_EXCL);
+        lines.push(`- ${a.name} → ${target}`);
+        break;
+      } catch (error) {
+        if (error.code !== "EEXIST") { lines.push(`- ${a.name}: couldn't copy (${error.code || error.message})`); break; }
+      }
+    }
+  }
+  return lines.join("\n");
+}
+
+const KINDS = ["image", "video", "audio", "pdf", "document", "text", "other"];
+
+function listAttachments({ conversation, type, query, from, since, before, limit = 50 } = {}) {
+  const index = conversationIndex();
+  const want = type ? String(type).toLowerCase().replace(/s$/, "") : null;
+  if (want && want !== "file" && !KINDS.includes(want)) throw new Error(`type must be one of: files, ${KINDS.join(", ")}`);
+  const params = [];
+  let where = "";
+  let scope = "all conversations";
+  if (conversation) {
+    const conv = resolveConversation(conversation, index);
+    where += ` AND cmj.chat_id IN (${placeholders(conv.chatIds)})`;
+    params.push(...conv.chatIds);
+    scope = describeConv(conv);
+  }
+  if (from) {
+    if (/^(me|myself|i)$/i.test(String(from).trim())) where += " AND m.is_from_me = 1";
+    else if (/^(them|others)$/i.test(String(from).trim())) where += " AND m.is_from_me = 0";
+    else throw new Error('from takes "me" or "them"; to see one person\'s attachments pass their name as conversation.');
+  }
+  if (query) { where += " AND ifnull(a.transfer_name, a.filename) LIKE ? ESCAPE '\\'"; params.push(likePattern(String(query).toLowerCase())); }
+  const s = parseTime(since, "since");
+  const b = parseTime(before, "before");
+  if (s) { where += " AND m.date >= ?"; params.push(dateToApple(s)); }
+  if (b) { where += " AND m.date < ?"; params.push(dateToApple(b)); }
+  const max = Math.min(Number(limit) || 50, 500);
+  // Kinds are decided from mime type and extension, so filter after fetching a wider window.
+  const rows = db().prepare(`
+    SELECT m.ROWID id, CAST(m.date AS REAL) date, m.is_from_me fromMe, m.handle_id hid, cmj.chat_id chatId, ${ATTACHMENT_COLUMNS}
+    FROM attachment a JOIN message_attachment_join maj ON maj.attachment_id = a.ROWID
+    JOIN message m ON m.ROWID = maj.message_id JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+    WHERE m.item_type = 0 AND ${REAL_ATTACHMENT}${where}
+    ORDER BY m.date DESC LIMIT ?`).all(...params, want ? Math.max(max * 20, 5000) : max);
+  const matches = rows
+    .map(r => ({ r, a: attachmentFromRow(r) }))
+    .filter(({ a }) => !want || (want === "file" ? !["image", "video", "audio"].includes(a.kind) : a.kind === want))
+    .slice(0, max);
+  const lines = matches.map(({ r, a }) => {
+    const sender = r.fromMe ? "Me" : displayHandle(index.handles.get(r.hid));
+    const conv = conversation ? "" : ` [${index.byChatId.get(r.chatId)?.name || "unknown chat"}]`;
+    const meta = [a.kind, fmtSize(a.size), isLocal(a) ? null : "in iCloud only"].filter(Boolean).join(", ");
+    return `#${r.id} ${fmtDate(appleToDate(r.date))}${conv} ${sender}: ${a.name} (${meta})`;
+  });
+  return `${lines.length} attachment(s)${want ? ` of type ${type}` : ""} in ${scope}, newest first. ` +
+    `Open one with view_attachments(message_id) or copy it out with save_attachment(message_id).\n\n${lines.join("\n") || "(none)"}`;
 }
 
 function normalizePhone(phone) {
@@ -840,18 +979,52 @@ const TOOLS = [
     run: searchContactsTool,
   },
   {
+    name: "list_attachments",
+    description: "Browse the files, photos and videos sent in a conversation (or across all of them), newest first, filtered by type, file name, sender or time range. Returns message ids for view_attachments and save_attachment.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        conversation: { type: "string", description: `Limit to one conversation. ${CONV_HINT}` },
+        type: { type: "string", enum: ["files", "image", "video", "audio", "pdf", "document", "text", "other"], description: '"files" means everything except photos, videos and audio; "document" is Word/RTF/HTML; "text" is Markdown, txt, CSV, JSON, code' },
+        query: { type: "string", description: "Only attachments whose file name contains this" },
+        from: { type: "string", description: '"me" (sent by me) or "them" (received)' },
+        since: { type: "string", description: TIME_HINT },
+        before: { type: "string", description: TIME_HINT },
+        limit: { type: "number", description: "Max results (default 50, max 500)" },
+      },
+    },
+    annotations: { title: "List Attachments", readOnlyHint: true, openWorldHint: false },
+    run: listAttachments,
+  },
+  {
     name: "view_attachments",
-    description: "Show the images attached to a message so you can see them (photos, screenshots, HEIC, GIF first frame). Takes a message id from read_conversation or search_messages. Non-image attachments are listed with their file paths.",
+    description: "Open the attachments on a message. Images (photos, screenshots, HEIC, GIF first frame) are shown so you can see them; PDFs, Word/RTF/HTML documents, Markdown, text, CSV, JSON and code are returned as text. Video, audio and other files are listed with their paths. Takes a message id from read_conversation, search_messages or list_attachments.",
     inputSchema: {
       type: "object",
       properties: {
         message_id: { type: "string", description: 'Message id, e.g. "#1234567"' },
         max_images: { type: "number", description: "Max images to return (default 4, max 10)" },
+        max_chars: { type: "number", description: "Max characters of text per file (default 20000, max 100000)" },
       },
       required: ["message_id"],
     },
     annotations: { title: "View Attachments", readOnlyHint: true, openWorldHint: false },
     run: viewAttachments,
+  },
+  {
+    name: "save_attachment",
+    description: "Copy a message's attachments (any file type) to a folder on this Mac, ~/Downloads by default. Keeps original file names and never overwrites an existing file.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        message_id: { type: "string", description: 'Message id, e.g. "#1234567"' },
+        destination: { type: "string", description: 'Folder to copy into (default "~/Downloads"); created if missing' },
+        attachment: { type: "string", description: "Only this attachment: its number on the message (1, 2, …) or part of its file name. Default: all" },
+      },
+      required: ["message_id"],
+    },
+    annotations: { title: "Save Attachment", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    run: saveAttachment,
   },
   {
     name: "send_imessage",
@@ -870,7 +1043,7 @@ const TOOLS = [
 ];
 
 const server = new Server(
-  { name: "imessage-mcp", version: "1.1.0" },
+  { name: "imessage-mcp", version: "1.2.0" },
   {
     capabilities: { tools: {} },
     instructions:

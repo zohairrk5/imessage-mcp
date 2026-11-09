@@ -2,9 +2,9 @@
   "manifest_version": "0.2",
   "name": "imessage-mcp",
   "display_name": "iMessage MCP",
-  "version": "1.1.0",
-  "description": "Slack-style context over your iMessages: conversations, group chats, full-text search, photos and real contact names.",
-  "long_description": "Gives Claude useful access to your Messages history on macOS. List conversations by activity, read DMs and group chats by contact or group name, search every message, see unread messages grouped by conversation, and send to a resolved person or group. Senders are shown by contact name. Everything is read locally and read-only from your Mac; nothing is uploaded. Requires Full Disk Access for Claude (System Settings > Privacy & Security > Full Disk Access). Not affiliated with Apple.",
+  "version": "1.2.0",
+  "description": "Slack-style context over your iMessages: conversations, group chats, full-text search, photos, files and real contact names.",
+  "long_description": "Gives Claude useful access to your Messages history on macOS. List conversations by activity, read DMs and group chats by contact or group name, search every message, browse, read and save the photos, PDFs and documents people send, see unread messages grouped by conversation, and send to a resolved person or group. Senders are shown by contact name. Everything is read locally and read-only from your Mac; nothing is uploaded. Requires Full Disk Access for Claude (System Settings > Privacy & Security > Full Disk Access). Not affiliated with Apple.",
   "author": {
     "name": "Zohair Khan",
     "url": "https://github.com/zohairrk5"
@@ -44,8 +44,16 @@
       "description": "Search contacts by name, phone or email"
     },
     {
+      "name": "list_attachments",
+      "description": "Browse the files, photos and videos sent in a conversation, by type, name and date"
+    },
+    {
       "name": "view_attachments",
-      "description": "See the photos and screenshots attached to a message"
+      "description": "See the photos in a message and read its PDFs, documents and text files"
+    },
+    {
+      "name": "save_attachment",
+      "description": "Copy a message's attachments to a folder, Downloads by default"
     },
     {
       "name": "send_imessage",
