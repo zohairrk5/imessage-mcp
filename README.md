@@ -13,6 +13,7 @@ real contact name. It runs entirely on your Mac.
 > "What was in the screenshot Sam sent in the team chat?"
 > "Draft a reply to Alex saying I'll be 10 minutes late; I'll send it myself."
 > "Text Mom happy birthday tomorrow at 9am."
+> "Save Jordan's new work number, 214 555 0123, to his contact."
 
 ## Install
 
@@ -61,7 +62,9 @@ Quit and reopen the app afterwards. Check it with `node ~/.imessage-mcp/bin/setu
 | `list_attachments` | Browses the files, photos and videos sent in a chat (or everywhere), filtered by type (`pdf`, `image`, `video`, `files`, …), file name, sender and date |
 | `view_attachments` | Opens a message's attachments. Photos and screenshots are shown so the assistant can see them (HEIC converted automatically); PDFs, Word docs, Markdown, text, CSV, JSON and code are read as text. Scanned PDFs show their first page |
 | `save_attachment` | Copies any attachment to a folder, `~/Downloads` by default, without overwriting existing files |
-| `search_contacts` | Contacts by name, phone (any format) or email, with their conversation if one exists |
+| `search_contacts` | Contacts by name, phone (any format) or email, with their conversation if one exists and the contact's id |
+| `create_contact` | Adds a contact to the Contacts app: name, company, phone numbers and emails with labels (mobile, home, work…). If someone already has that number or email, nothing is created and that contact is shown instead. See [Editing contacts](#editing-contacts) |
+| `update_contact` | Changes a contact's name or company, and adds, changes or removes phone numbers and emails. It only edits when the name, number, email or id matches exactly one contact, and shows the contact before and after |
 | `send_imessage` | Sends to a person or group chat. It only sends when the name matches exactly one recipient; otherwise it lists the candidates |
 | `draft_imessage` | Writes a message into the compose box of the right chat in Messages and **doesn't send it**. Messages opens on that chat; you read it, edit it if you like, and press Return yourself. Works for people and group chats |
 | `schedule_imessage` | Sends a message at a later time ("in 2h", "tomorrow 9am", "2026-11-20 08:00"), even with Claude closed. See [Scheduled messages](#scheduled-messages) |
@@ -73,6 +76,23 @@ Quit and reopen the app afterwards. Check it with `node ~/.imessage-mcp/bin/setu
 `draft_imessage` opens the chat through the `sms:` link Messages registers on every Mac, with the text filled in. It needs no
 extra permission and can't send anything: nothing presses Return for you. If that chat already had unsent text in its compose box,
 the draft replaces it.
+
+### Editing contacts
+
+`create_contact` and `update_contact` save through Apple's Contacts framework, the same way the Contacts app does, so changes sync to
+iCloud, Google and your phone. The Contacts databases themselves are never written to.
+
+- **One-time permission.** The first time you add or edit a contact, macOS asks whether the app running the server (Claude, or your
+  terminal or editor) may access your contacts. Click **OK**. If you clicked Don't Allow, turn it on in
+  *System Settings > Privacy & Security > Contacts*. The Contacts app doesn't open.
+- **New contacts go into your default account** (set in *Contacts > Settings > General > Default Account*) unless you name another,
+  such as iCloud or Google. The result says which account it went to.
+- **It never guesses which contact.** If a name matches several contacts (including the same person saved twice), nothing changes and
+  you get the candidates with their numbers and ids to choose from.
+- **Every edit shows the contact before and after**, so a wrong change is easy to spot and undo.
+- Notes can't be edited: macOS doesn't let scripts read or write contact notes. Deleting whole contacts isn't offered; removing a
+  single number or email is.
+- `node ~/.imessage-mcp/bin/setup.js --check` shows whether Contacts access is allowed.
 
 ### Scheduled messages
 
@@ -125,9 +145,10 @@ whenever they change, so a contact you save shows up by name on the next request
 ## Privacy
 
 - **Local only.** The server reads `~/Library/Messages/chat.db` and your Contacts databases **read-only** and makes no network requests.
-  Your assistant only sees what a tool call returns.
+  Your assistant only sees what a tool call returns. Contact edits go through macOS's Contacts framework, which syncs them like any edit.
 - **Sending is explicit.** `send_imessage` and `schedule_imessage` are the only tools that send anything, and MCP clients ask you before
   running them. `draft_imessage` only fills in a compose box. `save_attachment` only copies a file into a folder you choose.
+  `create_contact` and `update_contact` are the only tools that change your contacts, and they can't delete one.
 - Scheduled messages are stored on your Mac in a file only your user can read, and removed once sent. The background job's log
   (`scheduler.log` next to it) records ids and outcomes, never message text.
 - It isn't affiliated with or endorsed by Apple.
@@ -151,6 +172,7 @@ Any client that runs stdio MCP servers works. Point it at Node and `server.js`:
   without Claude's permissions. Install the `.mcpb` extension instead; extensions run inside Claude and inherit its access.
 - **A sender shows as a phone number**: that number isn't saved in Contacts. Save it and the name appears.
 - **Tools don't show up**: start a new session or chat after installing.
+- **"macOS is blocking this server from Contacts"**: turn on the app running the server in *System Settings > Privacy & Security > Contacts*.
 - **A scheduled message didn't send**: ask your assistant to list scheduled messages; it shows why. Check that the Automation permission
   for osascript is on (above) and that `setup.js --check` reports the background sender running.
 
@@ -170,7 +192,7 @@ In Claude Desktop, remove it under *Settings > Extensions*. In Cursor or Codex, 
 ```bash
 git clone https://github.com/zohairrk5/imessage-mcp && cd imessage-mcp && npm install
 node server.js --cli list_conversations '{"limit":5}'   # run any tool directly
-npm test                                                 # scheduler tests (never touch Messages)
+npm test                                                 # scheduler and contact-editing tests (never touch Messages or Contacts)
 ```
 
 See [`AGENTS.md`](AGENTS.md) for how the code is laid out and how releases work.
