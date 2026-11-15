@@ -24,7 +24,7 @@ Everything runs locally and reads the Messages database read-only.
 
 ## Rules
 
-- Never send a message (`send_imessage`) during setup or testing.
+- Never send or schedule a message (`send_imessage`, `schedule_imessage`) during setup or testing. `npm test` stubs every send.
 - Don't print the user's message contents while verifying; the self-test only reports a conversation count.
 - Don't add this server to `claude_desktop_config.json`. Servers started from that file don't inherit Claude's
   Full Disk Access and fail with "unable to open database file". Claude Desktop must use the `.mcpb` extension.
@@ -37,6 +37,10 @@ Everything runs locally and reads the Messages database read-only.
 - `server.js` holds the whole server: SQLite access through `/usr/bin/sqlite3`, the contacts index, decoding and the tools.
 - Test any tool without an MCP client: `node server.js --cli <tool> '<json args>'`, e.g. `node server.js --cli list_conversations '{"limit":5}'`.
 - `bin/setup.js` is the installer and `manifest.json` is the Claude Desktop extension manifest.
+- Scheduled messages: the queue is `~/Library/Application Support/imessage-mcp/scheduled.json`; a launchd agent
+  (`com.github.zohairrk5.imessage-mcp.scheduler`) runs `server.js --run-due` through `/usr/bin/osascript` every minute while
+  anything is pending, and removes itself when nothing is. `npm test` covers parsing, the queue and the never-send-twice rules.
+- Drafts open `sms:<handle>&body=…` (people) or `sms://open?groupid=<chat.group_id>&body=…` (groups); they never send.
 - Releases: bump `version` in `package.json`, `manifest.json` and the `Server` constructor in `server.js`, then push a `vX.Y.Z` tag.
   GitHub Actions builds `imessage-mcp.mcpb` and attaches it to the release.
 - chat.db facts that matter:
