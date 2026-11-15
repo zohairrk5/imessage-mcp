@@ -278,7 +278,7 @@ function displayHandle(handleId) {
 // Group chats stay one conversation per chat row.
 function conversationIndex() {
   const handles = loadHandles();
-  const chats = db().prepare("SELECT ROWID id, guid, chat_identifier ident, display_name dname, style FROM chat").all();
+  const chats = db().prepare("SELECT ROWID id, guid, chat_identifier ident, group_id gid, display_name dname, style FROM chat").all();
   const members = new Map();
   for (const r of db().prepare("SELECT chat_id, handle_id FROM chat_handle_join").all()) {
     if (!members.has(r.chat_id)) members.set(r.chat_id, []);
@@ -305,7 +305,7 @@ function conversationIndex() {
       conv = { key, isGroup, chats: [], handles: new Set(), named: Boolean(chat.dname), name: "", last: 0 };
       convs.set(key, conv);
     }
-    conv.chats.push({ id: chat.id, guid: chat.guid, last: last.get(chat.id) || 0 });
+    conv.chats.push({ id: chat.id, guid: chat.guid, ident: chat.ident, gid: chat.gid, last: last.get(chat.id) || 0 });
     for (const m of memberIds) conv.handles.add(m);
     if (!isGroup && !memberIds.length && chat.ident) conv.handles.add(chat.ident);
     conv.last = Math.max(conv.last, last.get(chat.id) || 0);
@@ -658,18 +658,19 @@ function getUnread({ limit = 50, since = "30d" }) {
   return `${rows.length} unread message(s)${s ? ` since ${fmtDate(s)}` : ""} across ${groups.size} conversation(s):\n\n${out.join("\n") || "(nothing unread)"}`;
 }
 
-async function sendMessage({ recipient, message }) {
+// Who a message goes to: an existing conversation, or (for a phone/email or a saved contact never
+// messaged) a new handle. Shared by send, draft and schedule so they all pick the same recipient.
+function resolveRecipient(recipient, message) {
   const to = String(recipient || "").trim();
   const text = String(message ?? "");
   if (!to || !text) throw new Error("recipient and message are required");
-
-  let conv = null;
-  let newHandle = null;
   try {
-    conv = resolveConversation(to);
+    const conv = resolveConversation(to);
+    return { conv, text, label: describeConv(conv) };
   } catch (error) {
+    let handle;
     if (isHandleLike(to)) {
-      newHandle = to.includes("@") ? to.trim() : normalizePhone(to);
+      handle = to.includes("@") ? to.trim() : normalizePhone(to);
     } else {
       // A saved contact you've never messaged: only if the name means exactly one person with one number/email.
       const people = contacts().list.filter(c => c.name.toLowerCase() === to.toLowerCase() || nameMatches(c.name, to));
@@ -680,33 +681,50 @@ async function sendMessage({ recipient, message }) {
         }
         throw error; // ambiguous or unknown: never guess who to send to
       }
-      newHandle = handles[0].includes("@") ? handles[0] : normalizePhone(handles[0]);
+      handle = handles[0].includes("@") ? handles[0] : normalizePhone(handles[0]);
     }
+    return { handle, text, label: `${contactFor(handle)?.name || handle} (${handle})` };
   }
+}
 
-  if (conv) {
-    const guid = conv.chats[0].guid; // most recently active chat for this person/group
-    await execFileAsync("/usr/bin/osascript", [
-      "-e", "on run argv",
-      "-e", 'tell application "Messages" to send (item 1 of argv) to chat id (item 2 of argv)',
-      "-e", "end run",
-      text, guid,
-    ]);
-    return `Sent to ${describeConv(conv)}.`;
-  }
-
-  // New conversation with a phone number or email.
-  const handle = newHandle;
+// Sends through Messages.app: to an existing chat by its guid, or to a handle as a new iMessage.
+// Needs nothing from chat.db, so the scheduler can call it with what was resolved at schedule time.
+async function deliver({ chat_guid, handle, text }) {
+  const script = chat_guid
+    ? ['tell application "Messages" to send (item 1 of argv) to chat id (item 2 of argv)']
+    : ['tell application "Messages"', "set svc to 1st account whose service type = iMessage", "send (item 1 of argv) to participant (item 2 of argv) of svc", "end tell"];
   await execFileAsync("/usr/bin/osascript", [
-    "-e", "on run argv",
-    "-e", 'tell application "Messages"',
-    "-e", "set svc to 1st account whose service type = iMessage",
-    "-e", "send (item 1 of argv) to participant (item 2 of argv) of svc",
-    "-e", "end tell",
-    "-e", "end run",
-    text, handle,
-  ]);
-  return `Sent to ${contactFor(handle)?.name || handle} (${handle}), new conversation via iMessage.`;
+    "-e", "on run argv", ...script.flatMap(line => ["-e", line]), "-e", "end run", text, chat_guid || handle,
+  ], { timeout: 60000 });
+}
+
+async function sendMessage({ recipient, message }) {
+  const r = resolveRecipient(recipient, message);
+  // An existing conversation goes to its most recently active chat (iMessage, SMS, …).
+  await deliver({ chat_guid: r.conv?.chats[0].guid, handle: r.handle, text: r.text });
+  return r.conv ? `Sent to ${r.label}.` : `Sent to ${r.label}, new conversation via iMessage.`;
+}
+
+// Puts the text in the compose box of the right chat in Messages without sending it, through the
+// sms: URL scheme Messages registers. Opening a URL needs no Automation or Accessibility permission,
+// and nothing here can press Return: the person reads the draft in Messages and sends it themselves.
+// Messages replaces whatever was already in that chat's compose box; an empty body doesn't clear it.
+async function draftMessage({ recipient, message }) {
+  const r = resolveRecipient(recipient, message);
+  const chat = r.conv?.chats[0];
+  let url;
+  if (r.conv?.isGroup) {
+    if (!chat.gid) throw new Error(`Can't open ${r.label} from outside Messages (it has no group id). Nothing was drafted.`);
+    url = `sms://open?groupid=${encodeURIComponent(chat.gid)}&body=${encodeURIComponent(r.text)}`;
+  } else {
+    const handle = r.conv ? chat.ident || [...r.conv.handles][0] : r.handle;
+    if (!handle) throw new Error(`Can't open ${r.label} from outside Messages (no phone number or email on it). Nothing was drafted.`);
+    url = `sms:${handle}&body=${encodeURIComponent(r.text)}`;
+  }
+  await execFileAsync("/usr/bin/open", [url]);
+  return `Draft placed in the compose box of ${r.label} in Messages, which is now open on that chat. Nothing was sent. ` +
+    "Tell the person to check or edit it there and press Return to send it. " +
+    "If that chat's compose box already held unsent text, the draft replaced it.";
 }
 
 // Claude reads JPEG/PNG/GIF/WebP, not HEIC or TIFF, so every image is converted to a JPEG with
@@ -1028,7 +1046,7 @@ const TOOLS = [
   },
   {
     name: "send_imessage",
-    description: "Send a message to a person or group chat via Messages.app. The recipient must resolve to exactly one conversation (otherwise the candidates are returned and nothing is sent). A raw phone number or email with no history starts a new iMessage conversation.",
+    description: "Send a message to a person or group chat via Messages.app, right now. The recipient must resolve to exactly one conversation (otherwise the candidates are returned and nothing is sent). A raw phone number or email with no history starts a new iMessage conversation. If the person wants to read and approve the message in the chat themselves, use draft_imessage instead.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1040,6 +1058,20 @@ const TOOLS = [
     annotations: { title: "Send iMessage", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     run: sendMessage,
   },
+  {
+    name: "draft_imessage",
+    description: "Write a message into the compose box of a person's or group chat's conversation in Messages.app WITHOUT sending it. Messages opens on that chat; the person reads it, edits it if they like, and presses Return to send. Use this when the person wants to approve messages in the chat themselves. Resolves recipients exactly like send_imessage. Replaces any unsent text already in that chat's compose box.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        recipient: { type: "string", description: CONV_HINT },
+        message: { type: "string", description: "Draft text" },
+      },
+      required: ["recipient", "message"],
+    },
+    annotations: { title: "Draft iMessage", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    run: draftMessage,
+  },
 ];
 
 const server = new Server(
@@ -1048,7 +1080,8 @@ const server = new Server(
     capabilities: { tools: {} },
     instructions:
       "The user's iMessage and SMS history from their Mac. Start with list_conversations or search_messages, " +
-      "then read_conversation for full context. All senders are shown by contact name; 'Me' is the user. Confirm wording and recipient with the user before send_imessage.",
+      "then read_conversation for full context. All senders are shown by contact name; 'Me' is the user. Confirm wording and recipient with the user before send_imessage. " +
+      "When the user wants to review or approve a message in the chat before it goes, use draft_imessage: it puts the text in Messages' compose box and never sends.",
   }
 );
 
