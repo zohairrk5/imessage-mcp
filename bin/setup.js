@@ -3,7 +3,7 @@
 // Claude Code, Cursor and Codex, installs the Claude Desktop extension, and runs a self-test.
 //
 //   node bin/setup.js            full setup
-//   node bin/setup.js --check    only check access, run the self-test and report scheduled messages
+//   node bin/setup.js --check    only check access, run the self-test, report scheduled messages and Contacts access
 //   flags: --skip-claude-code --skip-desktop --skip-cursor --skip-codex --no-open
 
 import { spawnSync } from "node:child_process";
@@ -100,6 +100,16 @@ async function reportScheduler() {
   if (s.needs_attention) warn(`${s.needs_attention} scheduled message(s) were missed, failed or interrupted; ask your assistant to list scheduled messages.`);
 }
 
+// create_contact and update_contact need the Contacts permission; checking it never shows a prompt.
+// The answer is for the app running this check (usually the terminal that also runs the assistant).
+async function reportContacts() {
+  const { contactsAccess } = await import("../server.js");
+  const access = contactsAccess();
+  if (access === "allowed") ok("Contacts editing: allowed");
+  else if (access === "not asked yet") ok("Contacts editing: macOS asks for access to Contacts the first time you create or edit a contact");
+  else if (access === "denied" || access === "restricted") warn(`Contacts editing: blocked. Turn on ${hostAppName()} in System Settings > Privacy & Security > Contacts.`);
+}
+
 function setupClaudeCode() {
   if (!has("claude")) return warn("Claude Code not found; skipping (install it, then rerun setup).");
   run("claude", ["mcp", "remove", NAME, "-s", "user"]);
@@ -159,6 +169,7 @@ checkPlatform();
 ensureDependencies();
 const canRead = selfTest();
 await reportScheduler();
+await reportContacts();
 
 if (!flags.has("--check")) {
   if (!flags.has("--skip-claude-code")) setupClaudeCode();
