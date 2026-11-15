@@ -243,12 +243,16 @@ function mtime(p) {
   }
 }
 
+// list: people with a phone or email, merged by name across accounts (for naming senders).
+// cards: every contact card as stored, one per account, with its id (the Contacts framework's
+// identifier, e.g. "1A2B…:ABPerson") and labels, for create_contact and update_contact.
 function contacts() {
   const paths = addressBookPaths();
   const signature = paths.map(p => `${p}:${mtime(p)}:${mtime(p + "-wal")}`).join("|");
   if (contactCache?.signature === signature) return contactCache;
 
   const list = [];
+  const cards = [];
   const byKey = new Map();
   const byName = new Map(); // same person synced from several sources gets merged by name
 
@@ -256,30 +260,40 @@ function contacts() {
     let ab;
     try {
       ab = new SqliteCli(path);
-      const records = ab.prepare("SELECT Z_PK id, ZFIRSTNAME first, ZMIDDLENAME middle, ZLASTNAME last, ZNICKNAME nick, ZORGANIZATION org FROM ZABCDRECORD").all();
-      const phones = ab.prepare("SELECT ZOWNER owner, ZFULLNUMBER v FROM ZABCDPHONENUMBER WHERE ZFULLNUMBER IS NOT NULL").all();
-      const emails = ab.prepare("SELECT ZOWNER owner, ZADDRESS v FROM ZABCDEMAILADDRESS WHERE ZADDRESS IS NOT NULL").all();
+      const records = ab.prepare("SELECT Z_PK id, ZUNIQUEID uid, ZFIRSTNAME first, ZMIDDLENAME middle, ZLASTNAME last, ZNICKNAME nick, ZORGANIZATION org FROM ZABCDRECORD").all();
+      const phones = ab.prepare("SELECT ZOWNER owner, ZFULLNUMBER v, ZLABEL label FROM ZABCDPHONENUMBER WHERE ZFULLNUMBER IS NOT NULL ORDER BY ZOWNER, ZORDERINGINDEX").all();
+      const emails = ab.prepare("SELECT ZOWNER owner, ZADDRESS v, ZLABEL label FROM ZABCDEMAILADDRESS WHERE ZADDRESS IS NOT NULL ORDER BY ZOWNER, ZORDERINGINDEX").all();
 
       const local = new Map();
       for (const r of records) {
         const name = [r.first, r.middle, r.last].filter(Boolean).join(" ").trim() || r.nick || r.org;
-        if (name) local.set(r.id, { name, nickname: r.nick || null, organization: r.org || null, phones: [], emails: [] });
-      }
-      for (const p of phones) local.get(p.owner)?.phones.push(p.v);
-      for (const e of emails) local.get(e.owner)?.emails.push(e.v);
-
-      for (const c of local.values()) {
-        if (!c.phones.length && !c.emails.length) continue;
-        let target = byName.get(c.name);
-        if (target) {
-          for (const p of c.phones) if (!target.phones.includes(p)) target.phones.push(p);
-          for (const e of c.emails) if (!target.emails.includes(e)) target.emails.push(e);
-        } else {
-          target = c;
-          byName.set(c.name, c);
-          list.push(c);
+        if (name) {
+          local.set(r.id, {
+            id: r.uid, name, first: r.first || "", middle: r.middle || "", last: r.last || "", nickname: r.nick || null,
+            organization: r.org || "", phones: [], emails: [],
+          });
         }
-        for (const v of [...c.phones, ...c.emails]) {
+      }
+      for (const p of phones) local.get(p.owner)?.phones.push({ label: p.label || "", value: p.v });
+      for (const e of emails) local.get(e.owner)?.emails.push({ label: e.label || "", value: e.v });
+
+      for (const card of local.values()) {
+        const isPerson = /:ABPerson$/.test(card.id || "");
+        if (isPerson) cards.push(card);
+        const ph = card.phones.map(p => p.value);
+        const em = card.emails.map(e => e.value);
+        if (!ph.length && !em.length) continue;
+        let target = byName.get(card.name);
+        if (target) {
+          for (const p of ph) if (!target.phones.includes(p)) target.phones.push(p);
+          for (const e of em) if (!target.emails.includes(e)) target.emails.push(e);
+        } else {
+          target = { name: card.name, nickname: card.nickname, organization: card.organization || null, phones: ph, emails: em, ids: [] };
+          byName.set(card.name, target);
+          list.push(target);
+        }
+        if (isPerson) target.ids.push(card.id);
+        for (const v of [...ph, ...em]) {
           const key = handleKey(v);
           if (key && !byKey.has(key)) byKey.set(key, target);
         }
@@ -291,7 +305,7 @@ function contacts() {
     }
   }
 
-  contactCache = { signature, list, byKey };
+  contactCache = { signature, list, cards, byKey };
   return contactCache;
 }
 
@@ -306,7 +320,11 @@ function searchContacts(query) {
   const isPhone = digits.length >= 4 && /^[\d\s()+.-]+$/.test(q);
   const needle = digits.length > 10 ? digits.slice(-10) : digits;
   const terms = q.split(/\s+/);
-  return contacts().list.filter(c => {
+  // Cards with no phone or email aren't in the merged list but can still be found (and edited).
+  const { list, cards } = contacts();
+  const bare = cards.filter(c => !c.phones.length && !c.emails.length)
+    .map(c => ({ name: c.name, nickname: c.nickname, organization: c.organization || null, phones: [], emails: [], ids: [c.id] }));
+  return [...list, ...bare].filter(c => {
     if (isPhone) return c.phones.some(p => p.replace(/\D/g, "").includes(needle));
     const hay = [c.name, c.nickname, c.organization].filter(Boolean).join(" ").toLowerCase();
     return terms.every(t => hay.includes(t)) || c.emails.some(e => e.toLowerCase().includes(q));
@@ -957,6 +975,8 @@ function searchContactsTool({ query }) {
     const conv = [...index.convs.values()].find(v => !v.isGroup && [...v.handles].some(h => keys.has(handleKey(h))));
     return {
       name: c.name,
+      // For update_contact. Several ids: the same name is saved as several cards (other accounts, or duplicates).
+      ...(c.ids.length > 1 ? { ids: c.ids } : c.ids.length ? { id: c.ids[0] } : {}),
       ...(c.organization && c.organization !== c.name ? { organization: c.organization } : {}),
       phones: c.phones,
       emails: c.emails,
@@ -964,6 +984,335 @@ function searchContactsTool({ query }) {
     };
   });
   return JSON.stringify(results, null, 2);
+}
+
+// ---------------------------------------------------------------- editing contacts
+//
+// Writes go through Apple's Contacts framework (CNContactStore), driven by JavaScript for Automation
+// in /usr/bin/osascript. The AddressBook databases are never written: the framework saves, and syncs
+// to iCloud/Google like an edit made in the Contacts app. It needs the Contacts privacy permission,
+// which macOS asks for once on behalf of the app running this server (Claude, or the terminal or
+// editor running the MCP client). Scripting the Contacts app instead would need the Automation
+// permission, launch Contacts, can't pick an account and is slow on big address books.
+// The framework hides contact notes from scripts (they need an Apple entitlement), so notes aren't editable.
+
+const CONTACTS_FIX = "System Settings > Privacy & Security > Contacts";
+const CONTACTS_DENIED = "macOS is blocking this server from Contacts, so nothing was changed. Tell the person to turn on the app running it " +
+  `(Claude, or the terminal or editor running their assistant) in ${CONTACTS_FIX}, then try again.`;
+const contactsTimeout = write => "Contacts didn't answer within a minute. macOS may be showing a dialog asking whether the app running this server " +
+  "may access Contacts: tell the person to click OK (Allow), then try again. " +
+  (write ? "The change may or may not have been saved: check with search_contacts before retrying." : "Nothing was changed.");
+
+// Runs one request through the Contacts framework. Ops: status, accounts, get {id}, create {container,
+// contact}, update {id, contact}. A contact is {first, last, organization, phones, emails}; phones and
+// emails are [{id?, label, value}], where an entry with an id keeps that existing number or address.
+const CONTACTS_JXA = String.raw`
+ObjC.import("Contacts");
+const S = $.CNContactStore.alloc.init;
+const KEYS = [$.CNContactIdentifierKey, $.CNContactGivenNameKey, $.CNContactMiddleNameKey, $.CNContactFamilyNameKey,
+  $.CNContactOrganizationNameKey, $.CNContactPhoneNumbersKey, $.CNContactEmailAddressesKey];
+const str = v => (v == null || v.isNil()) ? "" : ObjC.unwrap(v);
+function fail(err, what) {
+  const e = new Error(what + ": " + (err.isNil() ? "unknown error" : str(err.localizedDescription)));
+  e.code = err.isNil() ? 0 : Number(err.code);
+  throw e;
+}
+function checkAccess() {
+  const s = Number($.CNContactStore.authorizationStatusForEntityType(0)); // 0 not asked: the next call shows the prompt
+  if (s === 1 || s === 2) { const e = new Error("Contacts access denied"); e.code = 100; throw e; }
+}
+function containers(pred) {
+  const err = $();
+  const r = S.containersMatchingPredicateError(pred || $(), err);
+  if (r.isNil()) fail(err, "Couldn't list Contacts accounts");
+  const out = [];
+  for (let i = 0; i < Number(r.count); i++) out.push({ id: str(r.objectAtIndex(i).identifier), name: str(r.objectAtIndex(i).name) });
+  return out;
+}
+function fetch(id) {
+  const fr = $.CNContactFetchRequest.alloc.initWithKeysToFetch($(KEYS));
+  fr.setPredicate($.CNContact.predicateForContactsWithIdentifiers($([id])));
+  fr.setUnifyResults(false);
+  let found = null;
+  const err = $();
+  if (!S.enumerateContactsWithFetchRequestErrorUsingBlock(fr, err, (c, stop) => { found = c; })) fail(err, "Couldn't read the contact");
+  return found;
+}
+function values(arr, phone) {
+  const out = [];
+  for (let i = 0; i < Number(arr.count); i++) {
+    const lv = arr.objectAtIndex(i);
+    out.push({ id: str(lv.identifier), label: str(lv.label), value: phone ? str(lv.value.stringValue) : str(lv.value) });
+  }
+  return out;
+}
+function toJson(c) {
+  const id = str(c.identifier);
+  const acct = containers($.CNContainer.predicateForContainerOfContactWithIdentifier(id))[0];
+  return { id, first: str(c.givenName), middle: str(c.middleName), last: str(c.familyName), organization: str(c.organizationName),
+    phones: values(c.phoneNumbers, true), emails: values(c.emailAddresses, false), account: acct ? acct.name : "" };
+}
+function build(existing, list, wrap, what) {
+  const byId = {};
+  for (let i = 0; i < Number(existing.count); i++) byId[str(existing.objectAtIndex(i).identifier)] = existing.objectAtIndex(i);
+  return $(list.map(x => {
+    if (!x.id) return $.CNLabeledValue.labeledValueWithLabelValue(x.label, wrap(x.value));
+    const old = byId[x.id];
+    if (!old) throw new Error("A " + what + " on this contact changed while it was being edited; nothing was changed. Try again.");
+    const cur = values($([old]), what === "phone")[0];
+    if (cur.label === x.label && cur.value === x.value) return old;
+    return x.label ? old.labeledValueBySettingLabelValue(x.label, wrap(x.value)) : old.labeledValueBySettingValue(wrap(x.value));
+  }));
+}
+function apply(mc, want) {
+  if (want.first != null) mc.setGivenName(want.first);
+  if (want.last != null) mc.setFamilyName(want.last);
+  if (want.organization != null) mc.setOrganizationName(want.organization);
+  if (want.phones) mc.setPhoneNumbers(build(mc.phoneNumbers, want.phones, v => $.CNPhoneNumber.phoneNumberWithStringValue(v), "phone"));
+  if (want.emails) mc.setEmailAddresses(build(mc.emailAddresses, want.emails, v => $(v), "email"));
+}
+function save(req) {
+  const err = $();
+  if (!S.executeSaveRequestError(req, err)) fail(err, "Contacts didn't save the change");
+}
+function handle(q) {
+  if (q.op === "status") return { status: Number($.CNContactStore.authorizationStatusForEntityType(0)) };
+  checkAccess();
+  if (q.op === "accounts") return { default: str(S.defaultContainerIdentifier), accounts: containers() };
+  if (q.op === "get") { const c = fetch(q.id); return { contact: c ? toJson(c) : null }; }
+  if (q.op === "create") {
+    const mc = $.CNMutableContact.alloc.init;
+    apply(mc, q.contact);
+    const req = $.CNSaveRequest.alloc.init;
+    req.addContactToContainerWithIdentifier(mc, q.container);
+    save(req);
+    return { contact: toJson(fetch(str(mc.identifier))) };
+  }
+  if (q.op === "update") {
+    const c = fetch(q.id);
+    if (!c) throw new Error("That contact no longer exists; nothing was changed.");
+    const mc = c.mutableCopy;
+    apply(mc, q.contact);
+    const req = $.CNSaveRequest.alloc.init;
+    req.updateContact(mc);
+    save(req);
+    return { contact: toJson(fetch(q.id)) };
+  }
+  throw new Error("unknown op " + q.op);
+}
+function run(argv) {
+  try { return JSON.stringify(handle(JSON.parse(argv[0]))); }
+  catch (e) { return JSON.stringify({ error: String(e && e.message || e), code: e && e.code || 0 }); }
+}`;
+
+async function runContactsScript(request) {
+  const write = request.op === "create" || request.op === "update";
+  let stdout;
+  try {
+    ({ stdout } = await execFileAsync("/usr/bin/osascript", ["-l", "JavaScript", "-e", CONTACTS_JXA, JSON.stringify(request)], { timeout: 60000 }));
+  } catch (error) {
+    if (error.killed) throw new Error(contactsTimeout(write));
+    throw new Error(String(error.stderr || error.message).trim());
+  }
+  return contactsReply(stdout);
+}
+
+function contactsReply(stdout) {
+  const r = JSON.parse(stdout);
+  if (r.error) throw new Error(r.code === 100 ? CONTACTS_DENIED : r.error); // 100: CNErrorCodeAuthorizationDenied
+  return r;
+}
+
+// For setup.js --check: never prompts. The answer is for the app that ran the check.
+function contactsAccess() {
+  try {
+    const out = execFileSync("/usr/bin/osascript", ["-l", "JavaScript", "-e", CONTACTS_JXA, JSON.stringify({ op: "status" })], { encoding: "utf8", timeout: 10000 });
+    return { 0: "not asked yet", 1: "restricted", 2: "denied", 3: "allowed", 4: "limited" }[JSON.parse(out).status] || "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+const LABELS = {
+  mobile: "_$!<Mobile>!$_", cell: "_$!<Mobile>!$_", iphone: "iPhone", home: "_$!<Home>!$_", work: "_$!<Work>!$_", main: "_$!<Main>!$_",
+  other: "_$!<Other>!$_", school: "_$!<School>!$_", "home fax": "_$!<HomeFAX>!$_", "work fax": "_$!<WorkFAX>!$_", pager: "_$!<Pager>!$_",
+};
+const toLabel = l => LABELS[String(l).trim().toLowerCase()] || String(l).trim();
+const showLabel = l => (l || "").replace(/^_\$!<(.*)>!\$_$/, "$1").replace(/FAX$/, " fax").toLowerCase() || "no label";
+
+const asList = v => (v == null || v === "" ? [] : Array.isArray(v) ? v : [v]);
+const trimmed = v => (v == null ? undefined : String(v).trim());
+const sameValue = (kind, a, b) => (kind === "phone" ? phoneKey(a) === phoneKey(b) : a.trim().toLowerCase() === b.trim().toLowerCase());
+
+function checkValue(kind, v) {
+  const s = String(v ?? "").trim();
+  if (kind === "phone" && !(/^[\d\s()+.\-]+$/.test(s) && s.replace(/\D/g, "").length >= 3)) throw new Error(`"${s}" isn't a phone number. Nothing was changed.`);
+  if (kind === "email" && !/^[^\s@]+@[^\s@]+$/.test(s)) throw new Error(`"${s}" isn't an email address. Nothing was changed.`);
+  return s;
+}
+
+// Phones or emails from tool input: "214 555 0100" or {value, label}. Default label: mobile / home.
+function entries(input, kind) {
+  return asList(input).map(e => {
+    const value = checkValue(kind, typeof e === "object" ? e.value : e);
+    const label = typeof e === "object" && e.label ? e.label : kind === "phone" ? "mobile" : "home";
+    return { label: toLabel(label), value };
+  });
+}
+
+const fullName = c => [c.first, c.middle, c.last].filter(Boolean).join(" ") || c.organization || "(no name)";
+const showValues = list => list.map(x => `${showLabel(x.label)} ${x.value}`).join(", ") || "none";
+
+function cardText(c) {
+  const org = c.organization && c.organization !== fullName(c) ? ` (${c.organization})` : "";
+  return `  ${fullName(c)}${org}\n  phones: ${showValues(c.phones)}\n  emails: ${showValues(c.emails)}\n` +
+    `  id: ${c.id}${c.account ? `, account: ${c.account}` : ""}`;
+}
+
+const describeCard = c => `- ${fullName(c)}${c.organization && c.organization !== fullName(c) ? ` (${c.organization})` : ""}: ` +
+  `phones ${showValues(c.phones)}; emails ${showValues(c.emails)} [id: ${c.id}]`;
+
+const CONTACT_ID = /^[0-9a-f-]{36}:ABPerson$/i;
+
+// Exactly one card, by id, phone, email or name; otherwise nothing is changed and the candidates are listed.
+function resolveCard(input, cards) {
+  const s = String(input || "").trim();
+  if (!s) throw new Error("contact is required");
+  let matches;
+  if (CONTACT_ID.test(s)) {
+    matches = cards.filter(c => c.id.toLowerCase() === s.toLowerCase());
+  } else if (isHandleLike(s)) {
+    const key = handleKey(s);
+    matches = cards.filter(c => [...c.phones, ...c.emails].some(x => handleKey(x.value) === key));
+  } else {
+    const exact = cards.filter(c => c.name.toLowerCase() === s.toLowerCase());
+    matches = exact.length ? exact : cards.filter(c => nameMatches(c.name, s));
+  }
+  if (matches.length === 1) return matches[0];
+  if (!matches.length) throw new Error(`No contact matches "${s}". Nothing was changed. Find it with search_contacts.`);
+  throw new Error(`"${s}" matches ${matches.length} contacts, so nothing was changed. Ask the person which one they mean, then pass its id as contact:\n` +
+    matches.slice(0, 15).map(describeCard).join("\n") + (matches.length > 15 ? `\n…and ${matches.length - 15} more; be more specific.` : ""));
+}
+
+// Cards that already have one of these phone numbers (compared on the last 10 digits) or emails.
+function findDuplicates(cards, { phones = [], emails = [] }) {
+  return cards.filter(c => phones.some(p => c.phones.some(x => sameValue("phone", x.value, p.value))) ||
+    emails.some(e => c.emails.some(x => sameValue("email", x.value, e.value))));
+}
+
+// The card as it should be after an update_contact call. Pure: throws (nothing changed) on any problem.
+function planUpdate(before, args) {
+  const after = { ...before, phones: before.phones.map(x => ({ ...x })), emails: before.emails.map(x => ({ ...x })) };
+  for (const [arg, field] of [["first_name", "first"], ["last_name", "last"], ["organization", "organization"]]) {
+    if (args[arg] != null) after[field] = String(args[arg]).trim();
+  }
+  for (const kind of ["phone", "email"]) {
+    const key = `${kind}s`;
+    const find = value => {
+      const v = checkValue(kind, value);
+      const hits = after[key].filter(x => sameValue(kind, x.value, v));
+      if (!hits.length) throw new Error(`${fullName(before)} has no ${kind} ${v}. Nothing was changed. Their ${key}: ${showValues(before[key])}.`);
+      return hits;
+    };
+    for (const v of asList(args[`remove_${key}`])) {
+      const hits = find(typeof v === "object" ? v.value : v);
+      after[key] = after[key].filter(x => !hits.includes(x)); // every copy of that number or address
+    }
+    for (const ch of asList(args[`change_${key}`])) {
+      if (!ch || typeof ch !== "object" || ch.from == null) throw new Error(`change_${key} entries need "from" (the current ${kind}) and "to" and/or "label".`);
+      if (ch.to == null && ch.label == null) throw new Error(`change_${key}: say what "${ch.from}" becomes with "to" and/or "label".`);
+      const hits = find(ch.from);
+      if (hits.length > 1) throw new Error(`${ch.from} is on ${fullName(before)} ${hits.length} times; remove the copies first. Nothing was changed.`);
+      if (ch.to != null) hits[0].value = checkValue(kind, ch.to);
+      if (ch.label != null) hits[0].label = toLabel(ch.label);
+    }
+    for (const e of entries(args[`add_${key}`], kind)) {
+      if (after[key].some(x => sameValue(kind, x.value, e.value))) throw new Error(`${fullName(before)} already has ${kind} ${e.value}. Nothing was changed.`);
+      after[key].push(e);
+    }
+  }
+  if (!after.first && !after.last && !after.organization) throw new Error("A contact needs a first name, last name or company. Nothing was changed.");
+  return after;
+}
+
+// What differs between two versions of a card, one line each. Phones and emails are matched by their
+// id, so an entry without one (about to be added) counts as added.
+function describeChange(before, after) {
+  const lines = [];
+  const q = s => (s ? `"${s}"` : "(empty)");
+  if (fullName(before) !== fullName(after)) lines.push(`name: ${q(fullName(before))} → ${q(fullName(after))}`);
+  if ((before.organization || "") !== (after.organization || "")) lines.push(`company: ${q(before.organization)} → ${q(after.organization)}`);
+  for (const kind of ["phone", "email"]) {
+    const old = before[`${kind}s`];
+    const now = after[`${kind}s`];
+    for (const x of now) {
+      const was = x.id && old.find(o => o.id === x.id);
+      if (!was) lines.push(`${kind} added: ${showLabel(x.label)} ${x.value}`);
+      else if (was.value !== x.value || was.label !== x.label) lines.push(`${kind} changed: ${showLabel(was.label)} ${was.value} → ${showLabel(x.label)} ${x.value}`);
+    }
+    for (const o of old) if (!now.some(x => x.id === o.id)) lines.push(`${kind} removed: ${showLabel(o.label)} ${o.value}`);
+  }
+  return lines;
+}
+
+// After a save, Contacts writes the AddressBook database a moment later. Wait for it (up to 5 s) so
+// the next search_contacts, and the names on messages, already show the change.
+const cardKey = c => JSON.stringify([c.first || "", c.last || "", c.organization || "",
+  c.phones.map(p => phoneKey(p.value)).sort(), c.emails.map(e => e.value.toLowerCase()).sort()]);
+
+async function settleAddressBook(after, timeout = 5000) {
+  const want = cardKey(after);
+  for (const end = Date.now() + timeout; ;) {
+    const card = contacts().cards.find(c => c.id === after.id);
+    if (card && cardKey(card) === want) return true;
+    if (Date.now() > end) return false;
+    await new Promise(r => setTimeout(r, 150));
+  }
+}
+const NOT_SETTLED = "\n\nContacts saved it, but its database hadn't caught up after 5 seconds, so search_contacts may show the old details for a moment.";
+
+const CONTACT_DEPS = { run: runContactsScript, cards: () => contacts().cards, settle: settleAddressBook };
+
+async function createContact(args, deps = CONTACT_DEPS) {
+  const want = {
+    first: trimmed(args.first_name) || "", last: trimmed(args.last_name) || "", organization: trimmed(args.organization) || "",
+    phones: entries(args.phones, "phone"), emails: entries(args.emails, "email"),
+  };
+  if (!want.first && !want.last && !want.organization) throw new Error("first_name, last_name or organization is required");
+  for (const kind of ["phone", "email"]) {
+    const list = want[`${kind}s`];
+    const dup = list.find((x, i) => list.findIndex(y => sameValue(kind, x.value, y.value)) !== i);
+    if (dup) throw new Error(`${kind} ${dup.value} is listed twice. Nothing was created.`);
+  }
+  const existing = findDuplicates(deps.cards(), want);
+  if (existing.length) {
+    throw new Error(`Not created: ${existing.length === 1 ? "a contact" : `${existing.length} contacts`} already ${existing.length === 1 ? "has" : "have"} ` +
+      `that phone number or email. Use update_contact with the id instead:\n${existing.map(describeCard).join("\n")}`);
+  }
+  const { default: def, accounts } = await deps.run({ op: "accounts" });
+  let container = def;
+  if (args.account) {
+    const hit = accounts.find(a => a.name.toLowerCase() === String(args.account).trim().toLowerCase());
+    if (!hit) throw new Error(`No Contacts account named "${args.account}". Accounts: ${accounts.map(a => a.name).join(", ")}. Nothing was created.`);
+    container = hit.id;
+  }
+  const { contact } = await deps.run({ op: "create", container, contact: want });
+  const settled = await deps.settle(contact);
+  const where = container === def ? `${contact.account || "your"} (the default account)` : contact.account;
+  return `Created a new contact in ${where}:\n${cardText(contact)}${settled ? "" : NOT_SETTLED}`;
+}
+
+async function updateContact(args, deps = CONTACT_DEPS) {
+  const card = resolveCard(args.contact, deps.cards());
+  const { contact: before } = await deps.run({ op: "get", id: card.id });
+  if (!before) throw new Error(`Contact ${card.id} no longer exists in Contacts. Nothing was changed.`);
+  const planned = planUpdate(before, args);
+  if (!describeChange(before, planned).length) throw new Error(`Nothing to change: ${fullName(before)} already looks like that.`);
+  const { contact: after } = await deps.run({ op: "update", id: card.id, contact: planned });
+  const settled = await deps.settle(after);
+  return `Updated ${fullName(after)}${after.account ? ` in ${after.account}` : ""}:\n` +
+    describeChange(before, after).map(l => `- ${l}`).join("\n") +
+    `\n\nBefore:\n${cardText(before)}\nAfter:\n${cardText(after)}${settled ? "" : NOT_SETTLED}`;
 }
 
 // ---------------------------------------------------------------- scheduled messages
@@ -1321,6 +1670,9 @@ async function scheduleNotices() {
 
 const TIME_HINT = 'Relative ("24h", "7d", "2w", "today", "yesterday") or a date ("2026-10-01").';
 const CONV_HINT = 'A contact name ("Alex"), a named group chat, a phone number or email, or a ref like "chat:123" from list_conversations.';
+const LABEL_HINT = "Labels: mobile, iphone, home, work, main, other, school, home fax, work fax, pager, or any custom text.";
+const LABELED = { type: "object", properties: { value: { type: "string" }, label: { type: "string" } }, required: ["value"] };
+const CHANGE = { type: "object", properties: { from: { type: "string" }, to: { type: "string" }, label: { type: "string" } }, required: ["from"] };
 
 const TOOLS = [
   {
@@ -1389,7 +1741,7 @@ const TOOLS = [
   },
   {
     name: "search_contacts",
-    description: "Search contacts by name, phone number (any format) or email. Includes the ref of any existing conversation.",
+    description: "Search contacts by name, phone number (any format) or email. Includes the ref of any existing conversation, and the contact's id for update_contact (ids, plural, when the same person is saved as several cards, in different accounts or as duplicates).",
     inputSchema: {
       type: "object",
       properties: { query: { type: "string", description: "Name, phone, or email fragment" } },
@@ -1397,6 +1749,50 @@ const TOOLS = [
     },
     annotations: { title: "Search Contacts", readOnlyHint: true, openWorldHint: false },
     run: searchContactsTool,
+  },
+  {
+    name: "create_contact",
+    description: "Add a new contact to the Contacts app (syncs like any contact: iCloud, Google…). Goes into the default account unless account is given. " +
+      "If a contact already has one of the phone numbers or emails, nothing is created and that contact is returned: use update_contact instead. " +
+      "Confirm the exact name, numbers, emails and labels with the person before calling. The result shows the saved contact: read it back to them.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        first_name: { type: "string", description: "First name" },
+        last_name: { type: "string", description: "Last name" },
+        organization: { type: "string", description: "Company" },
+        phones: { type: "array", items: { anyOf: [{ type: "string" }, LABELED] }, description: `Phone numbers, e.g. ["214 555 0100"] or [{"value": "214 555 0100", "label": "work"}]. Label defaults to mobile. ${LABEL_HINT}` },
+        emails: { type: "array", items: { anyOf: [{ type: "string" }, LABELED] }, description: `Emails, as strings or {value, label}. Label defaults to home. ${LABEL_HINT}` },
+        account: { type: "string", description: 'Contacts account to save into, e.g. "iCloud", "Google", "On My Mac". Default: the default account set in Contacts' },
+      },
+    },
+    annotations: { title: "Create Contact", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    run: args => createContact(args),
+  },
+  {
+    name: "update_contact",
+    description: "Change an existing contact in the Contacts app: name, company, and add, change or remove phone numbers and emails. " +
+      "The contact must resolve to exactly one card; otherwise the candidates are returned with their ids and nothing changes, so ask the person which one and pass its id. " +
+      "Confirm the exact change (which contact, old and new values) with the person before calling. The result lists every change with before and after: read it back to them. " +
+      "Notes can't be edited (macOS doesn't let scripts read or write contact notes), and whole contacts can't be deleted.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        contact: { type: "string", description: "The contact's id from search_contacts (exact), or a name, phone number or email that matches exactly one contact" },
+        first_name: { type: "string", description: "New first name (\"\" clears it)" },
+        last_name: { type: "string", description: "New last name (\"\" clears it)" },
+        organization: { type: "string", description: "New company (\"\" clears it)" },
+        add_phones: { type: "array", items: { anyOf: [{ type: "string" }, LABELED] }, description: `Phone numbers to add, as strings or {value, label}. Label defaults to mobile. ${LABEL_HINT}` },
+        change_phones: { type: "array", items: CHANGE, description: 'Phone numbers to change: [{"from": "<current number, any format>", "to": "<new number>", "label": "work"}]; give to, label or both' },
+        remove_phones: { type: "array", items: { type: "string" }, description: "Phone numbers to remove from this contact (any format; every copy of that number goes)" },
+        add_emails: { type: "array", items: { anyOf: [{ type: "string" }, LABELED] }, description: `Emails to add, as strings or {value, label}. Label defaults to home. ${LABEL_HINT}` },
+        change_emails: { type: "array", items: CHANGE, description: 'Emails to change: [{"from": "<current email>", "to": "<new email>", "label": "work"}]; give to, label or both' },
+        remove_emails: { type: "array", items: { type: "string" }, description: "Emails to remove from this contact" },
+      },
+      required: ["contact"],
+    },
+    annotations: { title: "Update Contact", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    run: args => updateContact(args),
   },
   {
     name: "list_attachments",
@@ -1510,7 +1906,7 @@ const TOOLS = [
 ];
 
 const server = new Server(
-  { name: "imessage-mcp", version: "1.3.0" },
+  { name: "imessage-mcp", version: "1.4.0" },
   {
     capabilities: { tools: {} },
     instructions:
@@ -1518,7 +1914,9 @@ const server = new Server(
       "then read_conversation for full context. All senders are shown by contact name; 'Me' is the user. " +
       "Confirm wording and recipient with the user before send_imessage, and wording, recipient and time before schedule_imessage. " +
       "When the user wants to review or approve a message in the chat before it goes, use draft_imessage: it puts the text in Messages' compose box " +
-      "and never sends. If a tool result reports scheduled messages that weren't sent, tell the user.",
+      "and never sends. If a tool result reports scheduled messages that weren't sent, tell the user. " +
+      "create_contact and update_contact change the user's real Contacts (synced to their phone): confirm the exact change with the user first, " +
+      "never guess which contact (pass the id from search_contacts), and read the before/after in the result back to them.",
   }
 );
 
@@ -1543,6 +1941,7 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
 
 // Exposed for test/ and bin/setup.js, which import this file with IMESSAGE_MCP_IMPORT=1.
 export { parseSendTime, fmtWhen, withQueue, addScheduled, cancelScheduled, readQueue, runDue, takeNotices, schedulerStatus, GRACE_MS };
+export { createContact, updateContact, resolveCard, findDuplicates, planUpdate, describeChange, contactsReply, contactsTimeout, contactsAccess, phoneKey };
 
 if (process.env.IMESSAGE_MCP_IMPORT === "1") {
   // imported as a module: don't start anything
