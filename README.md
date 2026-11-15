@@ -11,6 +11,8 @@ real contact name. It runs entirely on your Mac.
 > "What did Alex say about the pricing change, and when?"
 > "Find the address someone sent me last month."
 > "What was in the screenshot Sam sent in the team chat?"
+> "Draft a reply to Alex saying I'll be 10 minutes late; I'll send it myself."
+> "Text Mom happy birthday tomorrow at 9am."
 
 ## Install
 
@@ -61,6 +63,34 @@ Quit and reopen the app afterwards. Check it with `node ~/.imessage-mcp/bin/setu
 | `save_attachment` | Copies any attachment to a folder, `~/Downloads` by default, without overwriting existing files |
 | `search_contacts` | Contacts by name, phone (any format) or email, with their conversation if one exists |
 | `send_imessage` | Sends to a person or group chat. It only sends when the name matches exactly one recipient; otherwise it lists the candidates |
+| `draft_imessage` | Writes a message into the compose box of the right chat in Messages and **doesn't send it**. Messages opens on that chat; you read it, edit it if you like, and press Return yourself. Works for people and group chats |
+| `schedule_imessage` | Sends a message at a later time ("in 2h", "tomorrow 9am", "2026-11-20 08:00"), even with Claude closed. See [Scheduled messages](#scheduled-messages) |
+| `list_scheduled_imessages` | What's scheduled, soonest first, plus anything that was missed |
+| `cancel_scheduled_imessage` | Cancels a scheduled message. To change one, cancel it and schedule it again |
+
+### Drafts
+
+`draft_imessage` opens the chat through the `sms:` link Messages registers on every Mac, with the text filled in. It needs no
+extra permission and can't send anything: nothing presses Return for you. If that chat already had unsent text in its compose box,
+the draft replaces it.
+
+### Scheduled messages
+
+Scheduled messages are kept in `~/Library/Application Support/imessage-mcp/scheduled.json`. When you schedule the first one, a small
+background job is added (`~/Library/LaunchAgents/com.github.zohairrk5.imessage-mcp.scheduler.plist`). It checks once a minute and sends
+what's due, so a message goes out within a minute of its time **even if Claude and your terminal are closed**. When nothing is left to
+send, the job removes itself.
+
+- **The Mac has to be on and awake.** If it's asleep or off at the scheduled time, the message is sent when it wakes only if that's
+  within 15 minutes. Later than that it isn't sent at all (a text arriving hours late is worse than none); it's kept as *missed*, and
+  your assistant tells you the next time it uses any iMessage tool.
+- **One-time permission.** The first time you schedule a message, macOS asks whether **“osascript” may control “Messages”**. Click
+  **OK**. The background job runs through Apple's `osascript`, so the permission survives Node updates. If you clicked Don't Allow,
+  turn it on in *System Settings > Privacy & Security > Automation > osascript > Messages*.
+- **Never sent twice.** A message is marked as sending before it's handed to Messages and removed once sent. If the Mac crashes in that
+  moment, it's flagged *interrupted* (check the chat) rather than sent again.
+- The recipient is worked out when you schedule, exactly as `send_imessage` would, so the job doesn't need to read your messages.
+- `node ~/.imessage-mcp/bin/setup.js --check` shows how many messages are pending and whether the job is running.
 
 ## Compared with the official "Read and Send iMessages" extension
 
@@ -96,8 +126,10 @@ whenever they change, so a contact you save shows up by name on the next request
 
 - **Local only.** The server reads `~/Library/Messages/chat.db` and your Contacts databases **read-only** and makes no network requests.
   Your assistant only sees what a tool call returns.
-- **Sending is explicit.** `send_imessage` is the only tool that changes anything, and MCP clients ask you before running it.
-  `save_attachment` only copies a file into a folder you choose; it never touches Messages.
+- **Sending is explicit.** `send_imessage` and `schedule_imessage` are the only tools that send anything, and MCP clients ask you before
+  running them. `draft_imessage` only fills in a compose box. `save_attachment` only copies a file into a folder you choose.
+- Scheduled messages are stored on your Mac in a file only your user can read, and removed once sent. The background job's log
+  (`scheduler.log` next to it) records ids and outcomes, never message text.
 - It isn't affiliated with or endorsed by Apple.
 
 ## Other MCP clients
@@ -119,12 +151,16 @@ Any client that runs stdio MCP servers works. Point it at Node and `server.js`:
   without Claude's permissions. Install the `.mcpb` extension instead; extensions run inside Claude and inherit its access.
 - **A sender shows as a phone number**: that number isn't saved in Contacts. Save it and the name appears.
 - **Tools don't show up**: start a new session or chat after installing.
+- **A scheduled message didn't send**: ask your assistant to list scheduled messages; it shows why. Check that the Automation permission
+  for osascript is on (above) and that `setup.js --check` reports the background sender running.
 
 ## Uninstall
 
 ```bash
 claude mcp remove imessage-mcp -s user   # Claude Code
-rm -rf ~/.imessage-mcp
+launchctl bootout gui/$(id -u)/com.github.zohairrk5.imessage-mcp.scheduler 2>/dev/null   # scheduled-message job, if any
+rm -f ~/Library/LaunchAgents/com.github.zohairrk5.imessage-mcp.scheduler.plist
+rm -rf ~/.imessage-mcp ~/Library/Application\ Support/imessage-mcp
 ```
 
 In Claude Desktop, remove it under *Settings > Extensions*. In Cursor or Codex, delete the `imessage-mcp` entry from `~/.cursor/mcp.json` or `~/.codex/config.toml`.
@@ -134,6 +170,7 @@ In Claude Desktop, remove it under *Settings > Extensions*. In Cursor or Codex, 
 ```bash
 git clone https://github.com/zohairrk5/imessage-mcp && cd imessage-mcp && npm install
 node server.js --cli list_conversations '{"limit":5}'   # run any tool directly
+npm test                                                 # scheduler tests (never touch Messages)
 ```
 
 See [`AGENTS.md`](AGENTS.md) for how the code is laid out and how releases work.
