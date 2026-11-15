@@ -3,7 +3,7 @@
 // Claude Code, Cursor and Codex, installs the Claude Desktop extension, and runs a self-test.
 //
 //   node bin/setup.js            full setup
-//   node bin/setup.js --check    only check access and run the self-test
+//   node bin/setup.js --check    only check access, run the self-test and report scheduled messages
 //   flags: --skip-claude-code --skip-desktop --skip-cursor --skip-codex --no-open
 
 import { spawnSync } from "node:child_process";
@@ -86,6 +86,20 @@ function selfTest() {
   return false;
 }
 
+// The background sender for scheduled messages is a launchd agent that only exists while something is scheduled.
+async function reportScheduler() {
+  process.env.IMESSAGE_MCP_IMPORT = "1";
+  const { schedulerStatus } = await import("../server.js");
+  const s = schedulerStatus();
+  const agent = s.agent_loaded ? "background sender running" : s.agent_installed ? "background sender installed but not loaded" : "no background sender";
+  const line = `Scheduled messages: ${s.pending} pending, ${agent}, Automation permission: ${s.automation}`;
+  if (s.pending && !s.agent_loaded) warn(`${line}. Schedule or cancel a message to restart the sender.`);
+  else if (s.pending && s.automation !== "ok") warn(`${line}. Allow it in System Settings > Privacy & Security > Automation > osascript > Messages.`);
+  else if (!s.pending && s.agent_installed) warn(`${line}. Nothing is scheduled; it removes itself within a minute.`);
+  else ok(line);
+  if (s.needs_attention) warn(`${s.needs_attention} scheduled message(s) were missed, failed or interrupted; ask your assistant to list scheduled messages.`);
+}
+
 function setupClaudeCode() {
   if (!has("claude")) return warn("Claude Code not found; skipping (install it, then rerun setup).");
   run("claude", ["mcp", "remove", NAME, "-s", "user"]);
@@ -144,6 +158,7 @@ console.log(bold("\nimessage-mcp setup\n"));
 checkPlatform();
 ensureDependencies();
 const canRead = selfTest();
+await reportScheduler();
 
 if (!flags.has("--check")) {
   if (!flags.has("--skip-claude-code")) setupClaudeCode();

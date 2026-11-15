@@ -7,3 +7,4 @@ CLAUDE.md
 .gitignore
 *.mcpb
 .DS_Store
+test/

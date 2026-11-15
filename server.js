@@ -6,10 +6,15 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { promisify } from "node:util";
-import { constants as fsConstants, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
-import { basename, extname, join, resolve } from "node:path";
+import {
+  constants as fsConstants, appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync,
+  readdirSync, renameSync, rmSync, statSync, writeFileSync,
+} from "node:fs";
+import { basename, dirname, extname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import os from "node:os";
 
 const execFileAsync = promisify(execFile);
@@ -70,14 +75,17 @@ const dateFmt = new Intl.DateTimeFormat("sv-SE", {
 });
 const fmtDate = d => (d ? dateFmt.format(d) : "?");
 
+// "90m", "2 hours", "3d", "1w" as milliseconds, or null.
+function relativeMs(s) {
+  const rel = s.match(/^(\d+(?:\.\d+)?)\s*(min|m|hr|h|d|w)[a-z]*$/);
+  return rel ? parseFloat(rel[1]) * { min: 6e4, m: 6e4, hr: 36e5, h: 36e5, d: 864e5, w: 6048e5 }[rel[2]] : null;
+}
+
 function parseTime(value, field) {
   if (value == null || value === "") return null;
   const s = String(value).trim().toLowerCase();
-  const rel = s.match(/^(\d+(?:\.\d+)?)\s*(min|m|hr|h|d|w)[a-z]*$/);
-  if (rel) {
-    const unit = { min: 6e4, m: 6e4, hr: 36e5, h: 36e5, d: 864e5, w: 6048e5 }[rel[2]];
-    return new Date(Date.now() - parseFloat(rel[1]) * unit);
-  }
+  const ms = relativeMs(s);
+  if (ms != null) return new Date(Date.now() - ms);
   if (s === "today" || s === "yesterday") {
     const d = new Date();
     d.setHours(0, 0, 0, 0);
@@ -90,6 +98,49 @@ function parseTime(value, field) {
   }
   const d = new Date(value);
   if (isNaN(d)) throw new Error(`Couldn't parse ${field} "${value}". Use e.g. "24h", "7d", "2w", "yesterday", "2026-10-01".`);
+  return d;
+}
+
+const weekdayFmt = new Intl.DateTimeFormat("en-US", { weekday: "short" });
+const zoneFmt = new Intl.DateTimeFormat("en-US", { timeZoneName: "short" });
+// "Sun 2026-11-15 18:30 CST": the weekday and zone make a wrong parse easy to spot.
+const fmtWhen = d => `${weekdayFmt.format(d)} ${fmtDate(d)} ${zoneFmt.formatToParts(d).find(p => p.type === "timeZoneName")?.value || ""}`.trim();
+
+function fmtSpan(ms) {
+  const m = Math.round(ms / 6e4);
+  if (m < 60) return `${m} min`;
+  if (m < 48 * 60) return `${Math.floor(m / 60)} h${m % 60 ? ` ${m % 60} min` : ""}`;
+  return `${Math.round(m / 1440)} days`;
+}
+
+// When to send a scheduled message: "in 2h", "45m", "tomorrow 9am", "today 18:30", "9:15pm", or a
+// date with a time ("2026-11-20 08:00", or ISO with an offset). Local time; must be in the future.
+function parseSendTime(value, now = new Date()) {
+  const raw = String(value ?? "").trim();
+  if (!raw) throw new Error("send_at is required");
+  const s = raw.toLowerCase().replace(/^in\s+/, "");
+  const hint = 'Use e.g. "in 2h", "45m", "tomorrow 9am", "today 18:30" or "2026-11-20 08:00".';
+  const ms = relativeMs(s);
+  const clock = s.match(/^(?:(today|tonight|tomorrow)\s+)?(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/);
+  let d;
+  if (ms != null) {
+    d = new Date(now.getTime() + ms);
+  } else if (clock && (clock[3] || clock[4])) {
+    let hour = Number(clock[2]);
+    const minute = Number(clock[3] || 0);
+    if (clock[4]) hour = hour >= 1 && hour <= 12 ? (hour % 12) + (clock[4] === "pm" ? 12 : 0) : 99;
+    if (hour > 23 || minute > 59) throw new Error(`Couldn't parse send_at "${raw}". ${hint}`);
+    d = new Date(now);
+    d.setHours(hour, minute, 0, 0);
+    if (clock[1] === "tomorrow") d.setDate(d.getDate() + 1);
+  } else if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    throw new Error(`send_at "${raw}" has no time of day; add one, e.g. "${raw} 09:00".`);
+  } else if (/^\d{4}-\d{2}-\d{2}[t ]\d/.test(s)) {
+    // Only ISO-style dates reach Date(): its lenient parsing reads "tomorrow 9" as a day in 2001.
+    d = new Date(raw.replace(/^(\d{4}-\d{2}-\d{2}) (\d)/, "$1T$2")); // "2026-11-20 08:00" as local time
+  }
+  if (!d || isNaN(d)) throw new Error(`Couldn't parse send_at "${raw}". ${hint}`);
+  if (d <= now) throw new Error(`send_at "${raw}" is ${fmtWhen(d)}, which is in the past. Nothing was scheduled.`);
   return d;
 }
 
@@ -915,6 +966,357 @@ function searchContactsTool({ query }) {
   return JSON.stringify(results, null, 2);
 }
 
+// ---------------------------------------------------------------- scheduled messages
+//
+// The queue is one JSON file. A per-user launchd agent runs `server.js --run-due` every minute while
+// something is scheduled, so messages go out with every MCP client closed (the Mac must be on and
+// awake). It's installed with the first scheduled message and removes itself once nothing is left.
+// The agent starts /usr/bin/osascript, which starts node: macOS asks for the Automation permission
+// ("control Messages") on behalf of that first process, and Apple's osascript keeps one identity
+// across Node upgrades, where a grant to Homebrew's node would be lost on every `brew upgrade`.
+//
+// Every read-modify-write holds an exclusive kernel lock (released by macOS if the process dies) and
+// replaces the file with an atomic rename. A due message is marked "sending" under the lock before it
+// goes to Messages and removed once sent, so two runs can never both send it. If a run dies mid-send
+// the message is marked "interrupted" for the person to check, and is never sent a second time.
+
+const STATE_DIR = `${HOME}/Library/Application Support/imessage-mcp`;
+const QUEUE_FILE = `${STATE_DIR}/scheduled.json`;
+const AUTOMATION_FILE = `${STATE_DIR}/automation.json`;
+const LOG_FILE = `${STATE_DIR}/scheduler.log`;
+const AGENT_LABEL = "com.github.zohairrk5.imessage-mcp.scheduler";
+const AGENT_PLIST = `${HOME}/Library/LaunchAgents/${AGENT_LABEL}.plist`;
+const SERVER_PATH = fileURLToPath(import.meta.url);
+const GRACE_MS = 15 * 6e4; // more than 15 minutes late (Mac asleep or off): don't send, report it
+const STUCK_MS = 10 * 6e4; // a send times out after a minute, so a claim this old belongs to a dead run
+const PENDING = new Set(["scheduled", "sending"]);
+const O_EXLOCK = 0x20; // macOS open(2) flag: flock the file as it opens
+
+const sleepSync = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+// Runs fn(queue) under the lock; writes the queue back if fn returns { changed: true, ... }.
+function withQueue(fn, file = QUEUE_FILE) {
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  const flags = fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_NONBLOCK | O_EXLOCK;
+  let fd;
+  for (const deadline = Date.now() + 10000; fd === undefined;) {
+    try {
+      fd = openSync(`${file}.lock`, flags, 0o600);
+    } catch (error) {
+      if (error.code !== "EAGAIN" || Date.now() > deadline) throw new Error(`Couldn't lock the scheduled-message queue (${error.code || error.message}); try again.`);
+      sleepSync(25);
+    }
+  }
+  try {
+    let queue = { messages: [] };
+    if (existsSync(file)) {
+      try {
+        queue = JSON.parse(readFileSync(file, "utf8"));
+      } catch (error) {
+        throw new Error(`The scheduled-message queue at ${file} is unreadable (${error.message}); fix or delete it.`);
+      }
+    }
+    const result = fn(queue) || {};
+    if (result.changed) {
+      const tmp = `${file}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify(queue, null, 2) + "\n", { mode: 0o600 });
+      renameSync(tmp, file);
+    }
+    return result;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function addScheduled({ to, chat_guid, handle, text, send_at }, file) {
+  const entry = {
+    id: randomBytes(3).toString("hex"), to, ...(chat_guid ? { chat_guid } : { handle }), text,
+    send_at: send_at.toISOString(), created_at: new Date().toISOString(), status: "scheduled",
+  };
+  return withQueue(q => {
+    q.messages.push(entry);
+    return { changed: true, entry, pending: q.messages.filter(m => PENDING.has(m.status)).length };
+  }, file).entry;
+}
+
+function cancelScheduled(id, file) {
+  const want = String(id || "").replace(/^#/, "").trim().toLowerCase();
+  if (!want) throw new Error("id is required (from list_scheduled_imessages)");
+  return withQueue(q => {
+    const m = q.messages.find(x => x.id === want);
+    if (!m) throw new Error(`No scheduled message ${want}. list_scheduled_imessages shows what's queued.`);
+    if (m.status === "sending") throw new Error(`${want} is being sent right now and can't be cancelled.`);
+    q.messages = q.messages.filter(x => x !== m);
+    return { changed: true, removed: m, pending: q.messages.filter(x => PENDING.has(x.status)).length };
+  }, file);
+}
+
+const readQueue = file => withQueue(q => ({ messages: q.messages }), file).messages;
+
+// One pass over the queue: claim what's due, send it, and settle the rest.
+//   send: async (entry) => void, throws on failure. canSend=false only flags overdue messages as missed
+//   (the live server does that so the assistant hears about it even if the agent never ran).
+async function runDue({ send, now = () => new Date(), file = QUEUE_FILE, canSend = true } = {}) {
+  const out = { sent: [], missed: [], failed: [], interrupted: [] };
+  const claimed = withQueue(q => {
+    const t = now().getTime();
+    const mine = [];
+    let changed = false;
+    for (const m of q.messages) {
+      if (m.status === "sending" && (!isAlive(m.claimed_by) || t - Date.parse(m.claimed_at) > STUCK_MS)) {
+        Object.assign(m, { status: "interrupted", error: "the sender stopped while handing this to Messages, so it may or may not have gone out" });
+        out.interrupted.push(m);
+        changed = true;
+      } else if (m.status === "scheduled" && Date.parse(m.send_at) <= t) {
+        if (t - Date.parse(m.send_at) > GRACE_MS) {
+          Object.assign(m, { status: "missed", error: `the Mac was asleep, off or busy at ${fmtWhen(new Date(m.send_at))}, and it's more than ${GRACE_MS / 6e4} minutes late` });
+          out.missed.push(m);
+          changed = true;
+        } else if (canSend) {
+          Object.assign(m, { status: "sending", claimed_by: process.pid, claimed_at: new Date(t).toISOString() });
+          mine.push(m.id);
+          changed = true;
+        }
+      }
+    }
+    return { changed, mine };
+  }, file).mine;
+
+  for (const id of claimed) {
+    const entry = readQueue(file).find(m => m.id === id);
+    let error = null;
+    try {
+      await send(entry);
+    } catch (e) {
+      error = String(e.stderr || e.message || e).trim().split("\n").pop();
+    }
+    withQueue(q => {
+      const m = q.messages.find(x => x.id === id);
+      if (!error) q.messages = q.messages.filter(x => x !== m);
+      else Object.assign(m, { status: "failed", error });
+      return { changed: true };
+    }, file);
+    (error ? out.failed : out.sent).push({ ...entry, ...(error ? { status: "failed", error } : {}) });
+  }
+  return out;
+}
+
+// Missed, failed and interrupted messages the assistant hasn't been told about yet, marked as told.
+function takeNotices(file = QUEUE_FILE) {
+  if (!existsSync(file)) return [];
+  return withQueue(q => {
+    const fresh = q.messages.filter(m => !PENDING.has(m.status) && !m.reported);
+    for (const m of fresh) m.reported = true;
+    return { changed: fresh.length > 0, fresh };
+  }, file).fresh;
+}
+
+function describeScheduled(m, now = new Date()) {
+  const when = new Date(m.send_at);
+  const due = m.status === "scheduled" ? (when > now ? ` (in ${fmtSpan(when - now)})` : " (due now)") : "";
+  const state = m.status === "scheduled" ? "" : ` [${m.status.toUpperCase()}${m.error ? `: ${m.error}` : ""}]`;
+  return `${m.id}  ${fmtWhen(when)}${due} → ${m.to}${state}\n    "${clip(m.text.replace(/\s+/g, " "), 200)}"`;
+}
+
+// ---- the launchd agent
+
+const uid = () => process.getuid();
+const launchctl = (...args) => spawnSync("/bin/launchctl", args, { encoding: "utf8" });
+const agentLoaded = () => launchctl("print", `gui/${uid()}/${AGENT_LABEL}`).status === 0;
+const xml = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+// Homebrew's process.execPath is a versioned Cellar path that disappears on upgrade; use its stable link.
+function stableNodePath() {
+  const m = process.execPath.match(/^(.*)\/Cellar\/node[^/]*\/[^/]+\/bin\/node$/);
+  return m && existsSync(`${m[1]}/bin/node`) ? `${m[1]}/bin/node` : process.execPath;
+}
+
+function agentPlist() {
+  const args = [
+    "/usr/bin/osascript", "-e", "on run argv",
+    "-e", 'do shell script quoted form of item 1 of argv & " " & quoted form of item 2 of argv & " --run-due"',
+    "-e", "return", "-e", "end run", stableNodePath(), SERVER_PATH, // "return": no empty result line in the log
+  ];
+  // Claude Desktop may run extensions on its own Electron binary, which acts as node only with this set.
+  const env = { HOME, ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {}) };
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+${args.map(a => `    <string>${xml(a)}</string>`).join("\n")}
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+${Object.entries(env).map(([k, v]) => `    <key>${k}</key><string>${xml(v)}</string>`).join("\n")}
+  </dict>
+  <key>StartInterval</key><integer>60</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>${xml(LOG_FILE)}</string>
+  <key>StandardErrorPath</key><string>${xml(LOG_FILE)}</string>
+</dict>
+</plist>
+`;
+}
+
+// Writes and loads the agent; loading runs it once straight away (RunAtLoad).
+function installAgent() {
+  const plist = agentPlist();
+  const current = existsSync(AGENT_PLIST) ? readFileSync(AGENT_PLIST, "utf8") : null;
+  const loaded = agentLoaded();
+  if (current === plist && loaded) return;
+  mkdirSync(dirname(AGENT_PLIST), { recursive: true });
+  writeFileSync(AGENT_PLIST, plist);
+  if (loaded) launchctl("bootout", `gui/${uid()}/${AGENT_LABEL}`);
+  const r = launchctl("bootstrap", `gui/${uid()}`, AGENT_PLIST);
+  if (r.status !== 0 && !agentLoaded()) throw new Error(`Couldn't start the background sender (launchctl: ${(r.stderr || r.stdout).trim()}).`);
+}
+
+// Stops the agent. Called by the agent itself when the queue empties, so bootout (which ends this
+// process) comes last, after the plist is gone.
+function removeAgent() {
+  rmSync(AGENT_PLIST, { force: true });
+  if (agentLoaded()) launchctl("bootout", `gui/${uid()}/${AGENT_LABEL}`);
+}
+
+function readAutomation() {
+  try {
+    return JSON.parse(readFileSync(AUTOMATION_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+// Sends one harmless Apple Event to Messages, so macOS asks for the Automation permission while the
+// person is scheduling rather than at send time. Records the outcome for schedule_imessage to report.
+function probeAutomation() {
+  writeFileSync(AUTOMATION_FILE, JSON.stringify({ status: "asking", at: new Date().toISOString() }));
+  const r = spawnSync("/usr/bin/osascript", ["-e", 'tell application "Messages" to count of accounts'], { encoding: "utf8", timeout: 5 * 6e4 });
+  const detail = (r.stderr || "").trim();
+  const status = r.status === 0 ? "ok" : /-1743|not authori[sz]ed/i.test(detail) ? "denied" : "error";
+  writeFileSync(AUTOMATION_FILE, JSON.stringify({ status, at: new Date().toISOString(), ...(status === "ok" ? {} : { detail }) }));
+}
+
+function log(line) {
+  try {
+    if (mtime(LOG_FILE) && statSync(LOG_FILE).size > 256 * 1024) rmSync(LOG_FILE);
+    appendFileSync(LOG_FILE, `${new Date().toISOString()} ${line}\n`);
+  } catch {}
+}
+
+// `server.js --run-due`: what the launchd agent runs. Logs ids and outcomes, never message text.
+async function runDueFromAgent() {
+  const send = entry => deliver(entry).catch(error => {
+    throw /-1743/.test(String(error.stderr || error.message)) ? new Error(`macOS blocked the background sender from controlling Messages (${PERMISSION_FIX})`) : error;
+  });
+  const r = await runDue({ send });
+  for (const m of r.sent) log(`sent ${m.id}`);
+  for (const k of ["missed", "failed", "interrupted"]) for (const m of r[k]) log(`${k} ${m.id}: ${m.error}`);
+  const { pending } = withQueue(q => {
+    const pending = q.messages.filter(m => PENDING.has(m.status)).length;
+    if (!pending) removeAgent(); // under the lock, so a message scheduled right now can't be stranded
+    return { pending };
+  });
+  if (pending && readAutomation().status !== "ok") probeAutomation();
+}
+
+const PERMISSION_FIX = "System Settings > Privacy & Security > Automation > osascript > turn on Messages";
+const SLEEP_NOTE = `It's sent by a background job within a minute of that time, even with Claude closed, as long as the Mac is on and awake. ` +
+  `If the Mac is asleep or off then, it goes out on wake only if that's within ${GRACE_MS / 6e4} minutes; otherwise it isn't sent and is reported as missed.`;
+
+// Waits briefly for the agent's permission check so the result can say whether sending will work.
+function automationReport() {
+  let a = readAutomation();
+  if (a.status !== "ok") {
+    launchctl("kickstart", `gui/${uid()}/${AGENT_LABEL}`);
+    for (let i = 0; i < 40 && readAutomation().status !== "ok" && readAutomation().status !== "denied"; i++) sleepSync(250);
+    a = readAutomation();
+  }
+  if (a.status === "ok") return "";
+  if (a.status === "denied") {
+    return `\n\nWARNING: macOS is blocking the background sender from controlling Messages, so this won't send. Tell the person to turn it on: ${PERMISSION_FIX}.`;
+  }
+  if (a.status === "error") {
+    return `\n\nWARNING: the background sender couldn't reach Messages to check its permission (${a.detail || "unknown error"}). It will try again within a minute.`;
+  }
+  return "\n\nACTION NEEDED: macOS should now be showing a dialog asking whether “osascript” may control “Messages”. " +
+    `Tell the person to click OK (Allow); until they do, scheduled messages can't be sent. If no dialog appears: ${PERMISSION_FIX}.`;
+}
+
+async function scheduleMessage({ recipient, message, send_at }) {
+  const when = parseSendTime(send_at);
+  const r = resolveRecipient(recipient, message);
+  const entry = addScheduled({ to: r.label, chat_guid: r.conv?.chats[0].guid, handle: r.handle, text: r.text, send_at: when });
+  try {
+    withQueue(() => installAgent());
+  } catch (error) {
+    cancelScheduled(entry.id);
+    throw new Error(`${error.message} Nothing was scheduled.`);
+  }
+  return `Scheduled ${entry.id}: to ${r.label} at ${fmtWhen(when)} (in ${fmtSpan(when - Date.now())}).\n` +
+    `Text: "${r.text}"\n${SLEEP_NOTE} Cancel with cancel_scheduled_imessage("${entry.id}").${automationReport()}`;
+}
+
+function listScheduled() {
+  const messages = existsSync(QUEUE_FILE) ? readQueue() : [];
+  messages.sort((a, b) => Date.parse(a.send_at) - Date.parse(b.send_at));
+  const pending = messages.filter(m => PENDING.has(m.status)).length;
+  const agent = pending ? (agentLoaded() ? "Background sender: running." : "Background sender: NOT running; schedule or cancel a message to restart it.") : "";
+  if (!messages.length) return "Nothing scheduled.";
+  return `${messages.length} scheduled message(s), soonest first. ${agent}\n\n${messages.map(m => describeScheduled(m)).join("\n")}` +
+    (pending < messages.length ? "\n\nMissed, failed or interrupted messages stay listed until cancelled; cancel_scheduled_imessage removes them." : "");
+}
+
+function cancelScheduledTool({ id }) {
+  const { removed, pending } = cancelScheduled(id);
+  if (!pending) {
+    withQueue(q => {
+      if (!q.messages.some(m => PENDING.has(m.status))) removeAgent();
+    });
+  }
+  return `Cancelled ${removed.id} (${removed.status}): to ${removed.to} at ${fmtWhen(new Date(removed.send_at))}. Nothing will be sent.`;
+}
+
+// For setup.js --check.
+function schedulerStatus() {
+  const messages = existsSync(QUEUE_FILE) ? readQueue() : [];
+  return {
+    pending: messages.filter(m => PENDING.has(m.status)).length,
+    needs_attention: messages.filter(m => !PENDING.has(m.status)).length,
+    agent_installed: existsSync(AGENT_PLIST),
+    agent_loaded: agentLoaded(),
+    automation: readAutomation().status || "not checked",
+  };
+}
+
+// Appended to every tool result: overdue messages flagged as missed, plus any missed/failed/interrupted
+// message the assistant hasn't mentioned yet. Never breaks the tool it's attached to.
+async function scheduleNotices() {
+  try {
+    if (!existsSync(QUEUE_FILE)) return "";
+    await runDue({ canSend: false });
+    const fresh = takeNotices();
+    if (!fresh.length) return "";
+    return "\n\n---\nTell the person: these scheduled messages were NOT sent as planned:\n" +
+      fresh.map(m => describeScheduled(m)).join("\n") +
+      "\nThey stay in list_scheduled_imessages until cancelled. Ask before resending any (send_imessage); check the chat first for an interrupted one.";
+  } catch {
+    return "";
+  }
+}
+
 // ---------------------------------------------------------------- MCP wiring
 
 const TIME_HINT = 'Relative ("24h", "7d", "2w", "today", "yesterday") or a date ("2026-10-01").';
@@ -1046,7 +1448,7 @@ const TOOLS = [
   },
   {
     name: "send_imessage",
-    description: "Send a message to a person or group chat via Messages.app, right now. The recipient must resolve to exactly one conversation (otherwise the candidates are returned and nothing is sent). A raw phone number or email with no history starts a new iMessage conversation. If the person wants to read and approve the message in the chat themselves, use draft_imessage instead.",
+    description: "Send a message to a person or group chat via Messages.app, right now. The recipient must resolve to exactly one conversation (otherwise the candidates are returned and nothing is sent). A raw phone number or email with no history starts a new iMessage conversation. If the person wants to read and approve the message in the chat themselves, use draft_imessage instead; to send later, schedule_imessage.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1072,16 +1474,51 @@ const TOOLS = [
     annotations: { title: "Draft iMessage", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     run: draftMessage,
   },
+  {
+    name: "schedule_imessage",
+    description: "Schedule a message to a person or group chat to be sent automatically at a later time, even if Claude is closed (the Mac must be on and awake; if it was asleep or off, the message is sent on wake only within 15 minutes, otherwise reported as missed). Confirm the exact wording, the recipient and the time with the person before scheduling. Resolves recipients exactly like send_imessage. The result echoes the time with its weekday: read it back to the person.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        recipient: { type: "string", description: CONV_HINT },
+        message: { type: "string", description: "Message text" },
+        send_at: { type: "string", description: 'When, in local time on this Mac: "in 2h", "45m", "tomorrow 9am", "today 18:30", "9:15pm", "2026-11-20 08:00", or ISO 8601 with an offset. Must be in the future.' },
+      },
+      required: ["recipient", "message", "send_at"],
+    },
+    annotations: { title: "Schedule iMessage", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    run: scheduleMessage,
+  },
+  {
+    name: "list_scheduled_imessages",
+    description: "List scheduled messages, soonest first, with their ids, recipients, send times and text, plus any that were missed, failed or interrupted.",
+    inputSchema: { type: "object", properties: {} },
+    annotations: { title: "List Scheduled iMessages", readOnlyHint: true, openWorldHint: false },
+    run: listScheduled,
+  },
+  {
+    name: "cancel_scheduled_imessage",
+    description: "Cancel a scheduled message by id so it is never sent, or clear a missed/failed one from the list. To change a scheduled message, cancel it and schedule a new one.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "string", description: "Id from list_scheduled_imessages or schedule_imessage" } },
+      required: ["id"],
+    },
+    annotations: { title: "Cancel Scheduled iMessage", readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    run: cancelScheduledTool,
+  },
 ];
 
 const server = new Server(
-  { name: "imessage-mcp", version: "1.2.0" },
+  { name: "imessage-mcp", version: "1.3.0" },
   {
     capabilities: { tools: {} },
     instructions:
       "The user's iMessage and SMS history from their Mac. Start with list_conversations or search_messages, " +
-      "then read_conversation for full context. All senders are shown by contact name; 'Me' is the user. Confirm wording and recipient with the user before send_imessage. " +
-      "When the user wants to review or approve a message in the chat before it goes, use draft_imessage: it puts the text in Messages' compose box and never sends.",
+      "then read_conversation for full context. All senders are shown by contact name; 'Me' is the user. " +
+      "Confirm wording and recipient with the user before send_imessage, and wording, recipient and time before schedule_imessage. " +
+      "When the user wants to review or approve a message in the chat before it goes, use draft_imessage: it puts the text in Messages' compose box " +
+      "and never sends. If a tool result reports scheduled messages that weren't sent, tell the user.",
   }
 );
 
@@ -1092,15 +1529,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 server.setRequestHandler(CallToolRequestSchema, async request => {
   const tool = TOOLS.find(t => t.name === request.params.name);
   if (!tool) throw new Error(`Unknown tool: ${request.params.name}`);
+  let result;
   try {
-    const result = await tool.run(request.params.arguments || {});
-    return typeof result === "string" ? { content: [{ type: "text", text: result }] } : result;
+    result = await tool.run(request.params.arguments || {});
+    result = typeof result === "string" ? { content: [{ type: "text", text: result }] } : result;
   } catch (error) {
-    return { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
+    result = { content: [{ type: "text", text: `Error: ${error.message}` }], isError: true };
   }
+  const notice = await scheduleNotices();
+  if (notice) result.content.push({ type: "text", text: notice.trim() });
+  return result;
 });
 
-if (process.argv[2] === "--cli") {
+// Exposed for test/ and bin/setup.js, which import this file with IMESSAGE_MCP_IMPORT=1.
+export { parseSendTime, fmtWhen, withQueue, addScheduled, cancelScheduled, readQueue, runDue, takeNotices, schedulerStatus, GRACE_MS };
+
+if (process.env.IMESSAGE_MCP_IMPORT === "1") {
+  // imported as a module: don't start anything
+} else if (process.argv[2] === "--run-due") {
+  await runDueFromAgent();
+} else if (process.argv[2] === "--cli") {
   // Local testing: node server.js --cli <tool> '<json args>'
   const tool = TOOLS.find(t => t.name === process.argv[3]);
   if (!tool) {
@@ -1110,6 +1558,8 @@ if (process.argv[2] === "--cli") {
   const result = await tool.run(JSON.parse(process.argv[4] || "{}"));
   if (typeof result === "string") console.log(result);
   else for (const c of result.content) console.log(c.type === "text" ? c.text : `[${c.mimeType} image, ${Math.round(c.data.length * 0.75 / 1024)} KB]`);
+  const notice = await scheduleNotices();
+  if (notice) console.log(notice.trim());
 } else {
   await server.connect(new StdioServerTransport());
 }
