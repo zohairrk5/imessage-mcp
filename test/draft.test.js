@@ -30,11 +30,12 @@ const noGid = { isGroup: true, displayName: "Old", name: "Old", handles: new Set
 const person = { isGroup: false, name: "Ann", handles: new Set(["+15551234567"]), chats: [{ id: 9, ident: "+15551234567" }] };
 
 // titles: what each read of Messages' window returns, in order (the last one repeats).
-function deps(conv, { titles = [""], messages = true } = {}) {
+function deps(conv, { titles = [""], messages = true, shows = false } = {}) {
   const opened = [];
   let reads = 0;
   return {
     opened,
+    shows: async () => shows,
     resolve: (to, text) => ({ conv, text, label: `${conv.name} [ref: chat:${conv.chats[0].id}]` }),
     hasMessages: () => messages,
     title: async () => titles[Math.min(reads++, titles.length - 1)],
@@ -48,6 +49,19 @@ await test("named group: opens without text, checks the title, then drafts", asy
   const out = await S.draftMessage({ recipient: "chat:68", message: "hi there" }, d);
   assert.deepEqual(d.opened, ["sms://open?groupid=D579-68", "sms://open?groupid=D579-68&body=hi%20there"]);
   assert.match(out, /window shows "Pakistan Trip"/);
+});
+
+await test("renamed group whose window kept the old title: drafted when Accessibility shows the group", async () => {
+  const d = deps(named, { titles: ["Old Trip Name"], shows: true });
+  const out = await S.draftMessage({ recipient: "chat:68", message: "hi" }, d);
+  assert.equal(d.opened.length, 2);
+  assert.match(out, /it shows "Pakistan Trip"/);
+});
+
+await test("renamed group's old title and Accessibility can't confirm it: refused", async () => {
+  const d = deps(named, { titles: ["Old Trip Name"], shows: false });
+  await assert.rejects(S.draftMessage({ recipient: "chat:68", message: "hi" }, d), /opened "Old Trip Name" instead of Pakistan Trip/);
+  assert.equal(d.opened.length, 1);
 });
 
 await test("group Messages opens as a New Message window: refused, no text sent to Messages", async () => {

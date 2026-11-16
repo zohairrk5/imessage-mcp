@@ -802,20 +802,34 @@ function hasMessages(chatId) {
     WHERE cmj.chat_id = ? AND m.item_type = 0 LIMIT 1`).get(chatId));
 }
 
+// Messages keeps a window's old title after the group is renamed (by anyone in it). Where this server
+// has Accessibility, the conversation title button and the sidebar's selected row, which do update,
+// show whether it's the named group anyway (see AX_JXA). Without it this is simply false.
+async function axShowsGroup(conv) {
+  try {
+    return (await axStep({ op: "state", expect: { name: conv.displayName } })).wrong === "";
+  } catch {
+    return false;
+  }
+}
+
 const DRAFT_DEPS = {
-  resolve: resolveRecipient, hasMessages, title: messagesWindowTitle,
+  resolve: resolveRecipient, hasMessages, title: messagesWindowTitle, shows: axShowsGroup,
   open: url => execFileAsync("/usr/bin/open", [url]), sleep: ms => new Promise(r => setTimeout(r, ms)),
 };
 
-// Wait up to ~3 seconds for Messages' front window to show the group; returns the last title read.
+// Wait up to ~3 seconds for Messages' front window to show the group. Returns the last title read and
+// what showed it was the group: "title", "accessibility" (a renamed group's stale title), or null.
 async function waitForGroupWindow(conv, deps) {
   let title;
   for (let i = 0; i < 12; i++) {
     await deps.sleep(250);
     title = await deps.title();
-    if (title === null || titleShowsGroup(title, conv)) return title;
+    if (title === null) return { title, shown: null };
+    if (titleShowsGroup(title, conv)) return { title, shown: "title" };
+    if (conv.displayName && title && await deps.shows(conv)) return { title, shown: "accessibility" };
   }
-  return title;
+  return { title, shown: null };
 }
 
 // Puts the text in the compose box of the right chat in Messages without sending it, through the
@@ -849,8 +863,8 @@ async function draftMessage({ recipient, message }, deps = DRAFT_DEPS) {
   }
   const url = `sms://open?groupid=${encodeURIComponent(chat.gid)}`;
   await deps.open(url);
-  const title = await waitForGroupWindow(r.conv, deps);
-  if (title !== null && !titleShowsGroup(title, r.conv)) {
+  const { title, shown } = await waitForGroupWindow(r.conv, deps);
+  if (title !== null && !shown) {
     throw new Error(`Messages opened ${title ? `"${title}"` : "no window"} instead of ${r.label}, so nothing was drafted. ` +
       "Tell the person to open the group in Messages and type the message there.");
   }
@@ -860,7 +874,8 @@ async function draftMessage({ recipient, message }, deps = DRAFT_DEPS) {
       "(that needs permission to control Messages, the same as sending), so it couldn't confirm which chat opened: tell the person to check that the window " +
       `shows ${r.conv.name} before pressing Return, and to delete the text if it's anywhere else.`;
   }
-  return `Draft placed in the compose box of ${r.label} in Messages, which is now open on that chat (its window shows "${title}"). ` +
+  const seen = shown === "title" ? `its window shows "${title}"` : `it shows "${r.conv.displayName}"`;
+  return `Draft placed in the compose box of ${r.label} in Messages, which is now open on that chat (${seen}). ` +
     "Nothing was sent. Tell the person to check or edit it there and press Return to send it. " +
     "If that chat's compose box already held unsent text, the draft replaced it.";
 }
