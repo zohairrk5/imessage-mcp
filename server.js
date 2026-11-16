@@ -347,7 +347,7 @@ function displayHandle(handleId) {
 // Group chats stay one conversation per chat row.
 function conversationIndex() {
   const handles = loadHandles();
-  const chats = db().prepare("SELECT ROWID id, guid, chat_identifier ident, group_id gid, display_name dname, style FROM chat").all();
+  const chats = db().prepare("SELECT ROWID id, guid, chat_identifier ident, group_id gid, display_name dname, style, service_name service FROM chat").all();
   const members = new Map();
   for (const r of db().prepare("SELECT chat_id, handle_id FROM chat_handle_join").all()) {
     if (!members.has(r.chat_id)) members.set(r.chat_id, []);
@@ -374,7 +374,7 @@ function conversationIndex() {
       conv = { key, isGroup, chats: [], handles: new Set(), named: Boolean(chat.dname), name: "", last: 0 };
       convs.set(key, conv);
     }
-    conv.chats.push({ id: chat.id, guid: chat.guid, ident: chat.ident, gid: chat.gid, last: last.get(chat.id) || 0 });
+    conv.chats.push({ id: chat.id, guid: chat.guid, ident: chat.ident, gid: chat.gid, service: chat.service, last: last.get(chat.id) || 0 });
     for (const m of memberIds) conv.handles.add(m);
     if (!isGroup && !memberIds.length && chat.ident) conv.handles.add(chat.ident);
     conv.last = Math.max(conv.last, last.get(chat.id) || 0);
@@ -1384,6 +1384,267 @@ async function updateContact(args, deps = CONTACT_DEPS) {
     `\n\nBefore:\n${cardText(before)}\nAfter:\n${cardText(after)}${settled ? "" : NOT_SETTLED}`;
 }
 
+// ---------------------------------------------------------------- renaming group chats
+//
+// Messages has no scriptable way to rename a group: AppleScript's chat `name` is read-only, no URL
+// opens a chat's details, Shortcuts has no such action, and IMCore refuses processes without Apple's
+// private entitlements. So this drives Messages' window through the Accessibility API (AXUIElement,
+// called from JavaScript for Automation in /usr/bin/osascript; about 0.25 s a step, where System
+// Events' view of the same window takes 20-40 s a read). The route: open the group by its groupid
+// link, the conversation title's context menu > "Edit Name & Photo", put the name in the sheet's one
+// text field, press Done. Every step that acts first checks, in the same process, that Messages is
+// frontmost and still shows that group. The rename counts as done only once chat.db shows it.
+//
+// The window title can't identify the chat: Messages keeps the old title after a rename. What it does
+// keep current is the conversation title button (the name, or "N People" for an unnamed group) and the
+// selected row in the sidebar (its description starts with the same name).
+
+// What chat.db says about a group's name.
+function groupState(chatId) {
+  const row = db().prepare("SELECT display_name name FROM chat WHERE ROWID = ?").get(chatId);
+  if (!row) throw new Error(`Chat ${chatId} no longer exists.`);
+  return { name: row.name || "" };
+}
+
+// Exactly one iMessage group that Messages still lists, or an error saying why nothing changed.
+function resolveGroupChat(input, { index, hasMessages: listed }) {
+  const conv = resolveConversation(input, index());
+  const chat = conv.chats[0];
+  if (!conv.isGroup) {
+    throw new Error(`${conv.name} is a one-to-one conversation, not a group chat; only group chats have a name. Nothing was changed.`);
+  }
+  if (chat.service !== "iMessage") {
+    throw new Error(`${conv.name} is ${chat.service === "RCS" ? "an RCS" : "an SMS"} group (green bubbles). Messages can only name iMessage groups. Nothing was changed.`);
+  }
+  if (!chat.gid) throw new Error(`Can't open ${conv.name} from outside Messages (it has no group id). Nothing was changed.`);
+  if (!listed(chat.id)) {
+    throw new Error(`Messages no longer lists ${conv.name}: no messages are left in it (deleted or expired), so it can't be opened to rename it. Nothing was changed.`);
+  }
+  return { conv, chat };
+}
+
+// The app macOS asks permissions for: the nearest .app above this process (Claude, Cursor, Terminal…).
+function hostApp() {
+  try {
+    let pid = process.ppid;
+    for (let i = 0; i < 12 && pid > 1; i++) {
+      const out = execFileSync("/bin/ps", ["-o", "ppid=,comm=", "-p", String(pid)], { encoding: "utf8" }).trim();
+      const [, ppid, comm] = out.match(/^(\d+)\s+(.*)$/) || [];
+      const app = comm?.match(/\/([^/]+)\.app\/Contents\/MacOS\//);
+      if (app) return app[1];
+      pid = Number(ppid);
+    }
+  } catch {}
+  return "the app running this server (Claude, or your terminal or editor)";
+}
+
+const AX_FIX = "System Settings > Privacy & Security > Accessibility";
+const axDenied = app => `macOS isn't letting this server control Messages' window, so nothing was changed. Renaming a group needs the ` +
+  `Accessibility permission: tell the person to open ${AX_FIX}, turn on ${app} (the app running this server), then fully quit and reopen it. ` +
+  "Don't try to change the setting yourself.";
+
+// The Accessibility steps, one per osascript run. `expect` says which chat must be showing:
+// { name } for a named group, { title } (the window title) for an unnamed one, "*" = whatever it shows now,
+// plus { window }, the window title when the sheet opened, for the steps inside the sheet.
+// Every acting step re-checks it first and returns { abort: reason } instead of acting.
+const AX_JXA = String.raw`
+ObjC.import("ApplicationServices"); ObjC.import("AppKit"); ObjC.import("CoreGraphics");
+const MESSAGES = "com.apple.MobileSMS";
+const cf = r => (r === undefined ? undefined : ObjC.castRefToObject(r));
+function attr(el, n) { const r = Ref(); return el && $.AXUIElementCopyAttributeValue(el, $(n), r) === 0 ? cf(r[0]) : undefined; }
+function str(el, n) { const v = attr(el, n); if (v === undefined || v.isNil()) return ""; const u = ObjC.unwrap(v); return typeof u === "string" ? u : String(u); }
+function kids(el) { const v = attr(el, "AXChildren"); const a = []; if (v && !v.isNil()) for (let i = 0; i < v.count; i++) a.push(v.objectAtIndex(i)); return a; }
+const pause = s => $.NSThread.sleepForTimeInterval(s);
+// Depth-first, never into the messages themselves or the sidebar's rows.
+function find(root, test, depth = 0, out = []) {
+  if (!root) return out;
+  if (test(root)) out.push(root);
+  const id = str(root, "AXIdentifier");
+  if (depth < 12 && id !== "TranscriptCollectionView" && id !== "ConversationList") for (const k of kids(root)) find(k, test, depth + 1, out);
+  return out;
+}
+const byId = (root, id) => find(root, e => str(e, "AXIdentifier") === id);
+const button = (root, label) => find(root, e => str(e, "AXRole") === "AXButton" && (str(e, "AXDescription") === label || str(e, "AXTitle") === label));
+function run(argv) {
+  const q = JSON.parse(argv[0]);
+  const front = ObjC.unwrap($.NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier) || "";
+  if (q.op === "activate") {
+    const a = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(q.app);
+    if (a.count) a.objectAtIndex(0).activateWithOptions(0);
+    return JSON.stringify({ ok: true });
+  }
+  if (!$.AXIsProcessTrusted()) return JSON.stringify({ front, denied: true });
+  const apps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier(MESSAGES);
+  if (!apps.count) return JSON.stringify({ front, title: null, wrong: "Messages isn't open" });
+  const pid = apps.objectAtIndex(0).processIdentifier;
+  const app = $.AXUIElementCreateApplication(pid);
+  const win = attr(app, "AXMainWindow");
+  const sheetOf = () => kids(win).find(k => str(k, "AXRole") === "AXSheet");
+  const sheet = win && sheetOf();
+  const title = win ? str(win, "AXTitle") : null;
+  // The title button reads empty while a sheet covers it.
+  const heading = win ? str(byId(win, "ConversationTitle")[0], "AXDescription").replace(/^\u200e/, "") : "";
+  const s = { front, title, heading, sheet: Boolean(sheet) };
+  function wrong(x) {
+    if (front !== MESSAGES) return "Messages isn't the frontmost app";
+    if (!win) return "Messages has no window open";
+    const want = x === "*" ? title : x.name || x.title;
+    // Behind a sheet Messages shows nothing of the chat (no title button, no selected row). The sheet is
+    // modal to its window, so the chat can't change under it: check it's still on the window it opened on.
+    if (sheet) return title === x.window ? "" : "Messages' window changed to \"" + title + "\"";
+    if (x !== "*" && (x.name ? heading !== x.name : !/^\d+ People$/.test(heading) || title !== x.title)) {
+      return "Messages shows \"" + (x.name ? heading : title) + "\"";
+    }
+    const rows = kids(byId(win, "ConversationList")[0]).filter(r => str(r, "AXSelected") === "true");
+    const row = rows.length === 1 ? str(rows[0], "AXDescription") : null;
+    if (row === null) return "no single conversation is selected in Messages' sidebar";
+    if (row !== want && !row.startsWith(want + ",")) return "the conversation selected in Messages' sidebar is a different one";
+    return "";
+  }
+  const field = () => { const f = find(sheetOf(), e => str(e, "AXRole") === "AXTextField"); return f.length === 1 ? f[0] : null; };
+  const done = () => { const b = button(sheetOf(), "Done"); return b.length === 1 ? b[0] : null; };
+  const abort = reason => JSON.stringify({ ...s, abort: reason });
+  if (q.op === "state") return JSON.stringify({ ...s, wrong: q.expect ? wrong(q.expect) : undefined });
+  if (q.op === "cancel") {
+    const out = { ...s };
+    for (const m of find(win, e => str(e, "AXRole") === "AXMenu")) $.AXUIElementPerformAction(m, $("AXCancel"));
+    const c = sheet && button(sheet, "Cancel");
+    if (c && c.length === 1) { out.cancelled = $.AXUIElementPerformAction(c[0], $("AXPress")) === 0; pause(0.6); }
+    // Cancelling after an edit asks "Discard Changes?" on top of the sheet.
+    for (const a of find(win, e => str(e, "AXSubrole") === "AXModalAlert")) {
+      const d = button(a, "Discard Changes");
+      if (d.length === 1) out.discarded = $.AXUIElementPerformAction(d[0], $("AXPress")) === 0;
+    }
+    pause(0.4);
+    out.sheet = Boolean(win && sheetOf());
+    return JSON.stringify(out);
+  }
+  if (!q.expect) return abort("no chat was given to check");
+  const w = wrong(q.expect);
+  if (w) return abort(w);
+  if (q.op === "openSheet") {
+    if (sheet) return abort("a sheet is already open in Messages");
+    const header = byId(win, "ConversationTitle")[0];
+    $.AXUIElementPerformAction(header, $("AXShowMenu"));
+    let menu;
+    for (let i = 0; i < 30 && !menu; i++) { pause(0.1); menu = find(win, e => str(e, "AXRole") === "AXMenu")[0]; }
+    if (!menu) return abort("the conversation's menu didn't open");
+    const item = kids(menu).find(i => str(i, "AXIdentifier") === "edit_name_&_photo" || /^Edit Name . Photo$/.test(str(i, "AXTitle")));
+    if (!item) { $.AXUIElementPerformAction(menu, $("AXCancel")); return abort("the conversation's menu has no Edit Name & Photo item"); }
+    return JSON.stringify({ ...s, ok: $.AXUIElementPerformAction(item, $("AXPress")) === 0 });
+  }
+  if (!sheet) return abort("the Edit Name & Photo sheet isn't open");
+  const f = field();
+  if (!f) return abort("the sheet doesn't have exactly one name field");
+  if (q.op === "fill") {
+    if (str(f, "AXValue") !== q.current) return abort("the sheet's name field doesn't show the group's current name");
+    // Setting the value alone only changes what the field shows (Done stays disabled), so the value
+    // goes in with a trailing space and one Delete, sent to Messages only once the field has focus.
+    // Typing the whole name instead would let the field capitalise and autocorrect it.
+    $.AXUIElementSetAttributeValue(f, $("AXFocused"), true);
+    $.AXUIElementSetAttributeValue(f, $("AXValue"), $(q.name + " "));
+    const focused = attr(app, "AXFocusedUIElement");
+    if (!focused || !$.CFEqual(focused, f)) return abort("the sheet's name field didn't take the keyboard focus");
+    if (str(f, "AXValue") !== q.name + " ") return abort("the sheet's name field didn't take the new name");
+    for (const down of [true, false]) $.CGEventPostToPid(pid, $.CGEventCreateKeyboardEvent(null, 51, down));
+    pause(0.3);
+    const d = done();
+    return JSON.stringify({ ...s, ok: true, value: str(f, "AXValue"), done: Boolean(d) && str(d, "AXEnabled") === "true" });
+  }
+  if (q.op === "confirm") {
+    if (str(f, "AXValue") !== q.name) return abort("the sheet's name field no longer shows the new name");
+    const d = done();
+    if (!d || str(d, "AXEnabled") !== "true") return abort("the sheet's Done button isn't available");
+    return JSON.stringify({ ...s, ok: $.AXUIElementPerformAction(d, $("AXPress")) === 0 });
+  }
+  return abort("unknown step " + q.op);
+}`;
+
+async function axStep(q) {
+  const { stdout } = await execFileAsync("/usr/bin/osascript", ["-l", "JavaScript", "-e", AX_JXA, JSON.stringify(q)], { timeout: 5000 });
+  return JSON.parse(stdout);
+}
+
+const MESSAGES_APP = "com.apple.MobileSMS";
+const RENAME_TIMEOUT = 20000;
+const RENAME_DEPS = {
+  index: conversationIndex, hasMessages, state: groupState, ax: axStep, host: hostApp, now: () => Date.now(),
+  open: url => execFileAsync("/usr/bin/open", [url]), sleep: ms => new Promise(r => setTimeout(r, ms)),
+};
+
+// Polls an Accessibility step every 250 ms, up to `tries` times, until `ok` accepts `times` results in a row.
+async function axUntil(deps, q, ok, tries, times = 1) {
+  let r;
+  for (let i = 0, run = 0; i < tries && run < times; i++) {
+    await deps.sleep(250);
+    r = await deps.ax(q);
+    run = ok(r) ? run + 1 : 0;
+  }
+  return r;
+}
+
+async function renameGroupChat({ conversation, name }, deps = RENAME_DEPS) {
+  const { conv, chat } = resolveGroupChat(conversation, deps);
+  const want = String(name ?? "").replace(/\s+/g, " ").trim();
+  if (!want) throw new Error("name is required (this tool can't remove a group's name). Nothing was changed.");
+  const before = deps.state(chat.id);
+  const shown = before.name ? `"${before.name}"` : `the unnamed group ${conv.name}`;
+  if (want === before.name) throw new Error(`Nothing to change: chat:${chat.id} is already named "${want}".`);
+
+  const first = await deps.ax({ op: "state" });
+  if (first.denied) throw new Error(axDenied(deps.host()));
+  const deadline = deps.now() + RENAME_TIMEOUT;
+  const step = async q => {
+    if (deps.now() > deadline) throw new Error(`Messages took more than ${RENAME_TIMEOUT / 1000} seconds.`);
+    const r = await deps.ax(q);
+    if (r.denied) throw new Error(axDenied(deps.host()));
+    if (r.abort) throw new Error(`Stopped before changing anything: ${r.abort}.`);
+    return r;
+  };
+  let expect = before.name ? { name: before.name } : null;
+  try {
+    await deps.open(`sms://open?groupid=${encodeURIComponent(chat.gid)}`);
+    // An unnamed group's window is titled with its members ("Ann & Bob") and headed "N People".
+    const unnamedShown = r => !r.wrong && Boolean(r.title?.includes(" & ")) && /^\d+ People$/.test(r.heading);
+    const seen = await axUntil(deps, { op: "state", expect: expect || "*" }, r => (expect ? !r.wrong : unnamedShown(r)), 20, 2);
+    if (!expect && unnamedShown(seen)) expect = { title: seen.title };
+    if (seen.wrong || !expect) {
+      throw new Error(`Stopped before changing anything: Messages didn't show ${shown} (${seen.wrong || `it shows "${seen.title}"`}).`);
+    }
+    expect = { ...expect, window: (await step({ op: "openSheet", expect })).title };
+    const sheet = await axUntil(deps, { op: "state" }, r => r.sheet, 12);
+    if (!sheet.sheet) throw new Error("Stopped before changing anything: the Edit Name & Photo sheet didn't open.");
+    const filled = await step({ op: "fill", expect, current: before.name, name: want });
+    if (filled.value !== want || !filled.done) throw new Error("Stopped before changing anything: Messages' name field didn't take the new name.");
+    await step({ op: "confirm", expect, name: want });
+    await axUntil(deps, { op: "state" }, r => !r.sheet, 12);
+  } catch (error) {
+    if (error.message.startsWith("macOS isn't letting")) throw error;
+    const why = error.cmd ? "a step in Messages failed or took more than 5 seconds." : error.message;
+    const c = await deps.ax({ op: "cancel" }).catch(() => ({ sheet: true }));
+    const now = deps.state(chat.id);
+    if (now.name !== before.name) {
+      throw new Error(`${why} But chat.db now names chat:${chat.id} "${now.name}" (it was ${shown}): tell the person to check the group in Messages.`);
+    }
+    throw new Error(`${why.replace(/^(?!Stopped)/, "Stopped: ")} Nothing was changed: chat.db still shows ${shown}.` +
+      (c.sheet ? " Messages may still show the Edit Name & Photo sheet: tell the person to press Cancel there." : ""));
+  } finally {
+    if (first.front && first.front !== MESSAGES_APP) await deps.ax({ op: "activate", app: first.front }).catch(() => {});
+  }
+
+  let after = deps.state(chat.id);
+  for (let i = 0; i < 20 && after.name !== want; i++) {
+    await deps.sleep(250);
+    after = deps.state(chat.id);
+  }
+  if (after.name !== want) {
+    throw new Error(`Messages accepted the new name, but after 5 seconds chat.db still names chat:${chat.id} ${after.name ? `"${after.name}"` : "nothing"}, ` +
+      "so treat it as NOT renamed. Tell the person to look at the group in Messages before trying again.");
+  }
+  return `Renamed group chat:${chat.id}.\nBefore: ${before.name ? `"${before.name}"` : `no name (shown as ${conv.name})`}\nAfter: "${after.name}"\n` +
+    "Everyone in the group sees a line in the conversation saying you named it.";
+}
+
 // ---------------------------------------------------------------- scheduled messages
 //
 // The queue is one JSON file. A per-user launchd agent runs `server.js --run-due` every minute while
@@ -1940,6 +2201,23 @@ const TOOLS = [
     run: draftMessage,
   },
   {
+    name: "rename_group_chat",
+    description: "Change the name of an iMessage group chat, the way Messages' \"Edit Name & Photo\" does. Everyone in the group sees the new name and a line in the conversation saying the user changed it, so confirm the exact group (pass its chat:<id> ref from list_conversations) and the exact new name with the person first, and read the before/after in the result back to them. " +
+      "Messages comes to the front for about 6 seconds while it works; tell the person not to type or click until it's done (if they do, it stops without changing anything). " +
+      "It checks that Messages shows that group before opening the name sheet and again before confirming, and reports success only once Messages' database shows the new name. " +
+      "Refuses one-to-one chats, SMS/RCS (green bubble) groups and groups Messages no longer lists. Needs the Accessibility permission for the app running this server (System Settings > Privacy & Security > Accessibility); if the result says it's missing, tell the person how to turn it on and never try to change it yourself. Can't remove a name or change the group photo.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        conversation: { type: "string", description: "The group: a ref like \"chat:123\" from list_conversations, or the group's current name" },
+        name: { type: "string", description: "The new group name, exactly as it should appear" },
+      },
+      required: ["conversation", "name"],
+    },
+    annotations: { title: "Rename Group Chat", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    run: renameGroupChat,
+  },
+  {
     name: "schedule_imessage",
     description: "Schedule a message to a person or group chat to be sent automatically at a later time, even if Claude is closed (the Mac must be on and awake; if it was asleep or off, the message is sent on wake only within 15 minutes, otherwise reported as missed). Confirm the exact wording, the recipient and the time with the person before scheduling. Resolves recipients exactly like send_imessage. The result echoes the time with its weekday: read it back to the person.",
     inputSchema: {
@@ -1985,7 +2263,8 @@ const server = new Server(
       "When the user wants to review or approve a message in the chat before it goes, use draft_imessage: it puts the text in Messages' compose box " +
       "and never sends. If a tool result reports scheduled messages that weren't sent, tell the user. " +
       "create_contact and update_contact change the user's real Contacts (synced to their phone): confirm the exact change with the user first, " +
-      "never guess which contact (pass the id from search_contacts), and read the before/after in the result back to them.",
+      "never guess which contact (pass the id from search_contacts), and read the before/after in the result back to them. " +
+      "rename_group_chat changes a group's name for everyone in it: confirm the group and the exact name with the user first.",
   }
 );
 
@@ -2011,7 +2290,7 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
 // Exposed for test/ and bin/setup.js, which import this file with IMESSAGE_MCP_IMPORT=1.
 export { parseSendTime, fmtWhen, withQueue, addScheduled, cancelScheduled, readQueue, runDue, takeNotices, schedulerStatus, GRACE_MS };
 export { createContact, updateContact, resolveCard, findDuplicates, planUpdate, describeChange, contactsReply, contactsTimeout, contactsAccess, phoneKey };
-export { draftMessage, titleShowsGroup };
+export { draftMessage, titleShowsGroup, renameGroupChat };
 
 if (process.env.IMESSAGE_MCP_IMPORT === "1") {
   // imported as a module: don't start anything
