@@ -14,6 +14,7 @@ real contact name. It runs entirely on your Mac.
 > "Draft a reply to Alex saying I'll be 10 minutes late; I'll send it myself."
 > "Text Mom happy birthday tomorrow at 9am."
 > "Save Jordan's new work number, 214 555 0123, to his contact."
+> "Rename the Acme leads group to 'Acme x Dallas Expo'."
 
 ## Install
 
@@ -67,6 +68,7 @@ Quit and reopen the app afterwards. Check it with `node ~/.imessage-mcp/bin/setu
 | `update_contact` | Changes a contact's name or company, and adds, changes or removes phone numbers and emails. It only edits when the name, number, email or id matches exactly one contact, and shows the contact before and after |
 | `send_imessage` | Sends to a person or group chat. It only sends when the name matches exactly one recipient; otherwise it lists the candidates |
 | `draft_imessage` | Writes a message into the compose box of the right chat in Messages and **doesn't send it**. Messages opens on that chat; you read it, edit it if you like, and press Return yourself. Works for people and group chats |
+| `rename_group_chat` | Renames an iMessage group chat, as Messages' *Edit Name & Photo* does. Everyone in the group sees the new name. It only renames when it can check Messages is showing that group, and reports success only once Messages has saved it. See [Renaming group chats](#renaming-group-chats) |
 | `schedule_imessage` | Sends a message at a later time ("in 2h", "tomorrow 9am", "2026-11-20 08:00"), even with Claude closed. See [Scheduled messages](#scheduled-messages) |
 | `list_scheduled_imessages` | What's scheduled, soonest first, plus anything that was missed |
 | `cancel_scheduled_imessage` | Cancels a scheduled message. To change one, cancel it and schedule it again |
@@ -82,6 +84,30 @@ of Messages' window, and only adds the text once the window shows that group; ot
 window title needs the same permission to control Messages that sending uses (System Settings > Privacy & Security > Automation).
 Without it the draft still goes in, and the reply says to check which chat is open before pressing Return. A group
 with no messages left on this Mac (all deleted or expired) can't be opened from outside Messages at all, so it's refused.
+
+A group that was renamed while Messages was open keeps its old name in the window title. If the app running the server has the
+Accessibility permission (see [Renaming group chats](#renaming-group-chats)), `draft_imessage` then checks the conversation's title
+and the selected chat in the sidebar instead; without it, such a draft is refused until Messages is reopened.
+
+### Renaming group chats
+
+Messages has no scripting command for a group's name, so `rename_group_chat` does what you would do by hand: it opens the group,
+chooses *Edit Name & Photo* from the conversation title's menu, puts the name in, and presses *Done*.
+
+- **Everyone in the group sees it.** The group's name changes for every member and a line appears in the conversation saying you
+  named it. Your assistant confirms the group and the exact name with you first.
+- **Don't type or click for about 6 seconds.** Messages comes to the front while it works and the app you were in comes back
+  afterwards. Right before opening the name sheet and again right before pressing *Done*, it checks that Messages is still in front
+  and still on that group (the conversation's title and the chat selected in the sidebar), and that the name field holds exactly
+  the new name. If anything is off it presses *Cancel* and changes nothing. It never presses Return and never types into a message.
+- **It's only reported as renamed once Messages' database shows the new name.** The reply shows the name before and after.
+- **One-time permission: Accessibility.** Controlling Messages' window needs *System Settings > Privacy & Security > Accessibility*
+  turned on for the app running the server (Claude, or your terminal or editor). If it's off, nothing is changed and the reply says
+  which app to turn on. Then quit and reopen that app.
+- **iMessage groups only.** One-to-one chats have no group name, SMS and RCS (green bubble) groups can't be named, and a group with no
+  messages left on this Mac can't be opened from outside Messages, so these are refused.
+- It can't remove a name or change the group photo (Messages only offers photos from your Photos library, through its own picker),
+  and it needs Messages in English, the language its menu and buttons are matched in.
 
 ### Editing contacts
 
@@ -155,6 +181,7 @@ whenever they change, so a contact you save shows up by name on the next request
 - **Sending is explicit.** `send_imessage` and `schedule_imessage` are the only tools that send anything, and MCP clients ask you before
   running them. `draft_imessage` only fills in a compose box. `save_attachment` only copies a file into a folder you choose.
   `create_contact` and `update_contact` are the only tools that change your contacts, and they can't delete one.
+  `rename_group_chat` is the only tool that changes a chat, and only its name.
 - Scheduled messages are stored on your Mac in a file only your user can read, and removed once sent. The background job's log
   (`scheduler.log` next to it) records ids and outcomes, never message text.
 - It isn't affiliated with or endorsed by Apple.
@@ -179,6 +206,8 @@ Any client that runs stdio MCP servers works. Point it at Node and `server.js`:
 - **A sender shows as a phone number**: that number isn't saved in Contacts. Save it and the name appears.
 - **Tools don't show up**: start a new session or chat after installing.
 - **"macOS is blocking this server from Contacts"**: turn on the app running the server in *System Settings > Privacy & Security > Contacts*.
+- **"isn't letting this server control Messages' window"**: renaming a group needs the Accessibility permission for the app running the
+  server: *System Settings > Privacy & Security > Accessibility*. Quit and reopen the app afterwards.
 - **A scheduled message didn't send**: ask your assistant to list scheduled messages; it shows why. Check that the Automation permission
   for osascript is on (above) and that `setup.js --check` reports the background sender running.
 

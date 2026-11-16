@@ -25,6 +25,9 @@ Everything runs locally and reads the Messages database read-only.
 ## Rules
 
 - Never send or schedule a message (`send_imessage`, `schedule_imessage`) during setup or testing. `npm test` stubs every send.
+- Never rename a real group chat while testing (`rename_group_chat`): every member sees it. Test only on a group whose members are
+  all the user's own phone number and Apple ID email (Messages does keep that as a group, style 43), with the user's go-ahead.
+  `npm test` fakes every Messages step.
 - Never create or edit a real contact while testing (`create_contact`, `update_contact`): the address book syncs to iCloud and the
   user's phone. `npm test` uses a fake Contacts. For a live check, create one obviously fake contact (e.g. "ZZ imessage-mcp Test",
   a 555-01xx number, an example.com email), test only on it, delete it afterwards, and confirm the contact count is unchanged.
@@ -49,6 +52,22 @@ Everything runs locally and reads the Messages database read-only.
   Messages ignores the group link for a group it no longer lists (no messages left in chat.db) and opens a New Message
   window to your own Apple ID instead, so group drafts open without the text first and check Messages' window title.
   Never test drafts with the screen locked: System Events sees no windows then, so a test draft can't be read back or cleared.
+- Renaming groups drives Messages' window through the Accessibility API from JavaScript for Automation (`AX_JXA`): about 0.25 s a
+  step, where System Events' view of the same window took 20-40 s a read. Route: `sms://open?groupid=`, the context menu of the
+  `ConversationTitle` button > "Edit Name & Photo" (`edit_name_&_photo`), the sheet's one `AXTextField`, then the "Done" button.
+  What was learned mapping it (macOS 26):
+  - The window title is not the chat: Messages keeps a window's old title after a rename. The `ConversationTitle` button's
+    description (the group's name, or "N People" when unnamed) and the selected row of `ConversationList` (its description starts
+    with the same name) are current. Behind an open sheet neither can be read, so steps inside the sheet check the window the sheet
+    opened on instead (the sheet is modal to it).
+  - Setting the name field's `AXValue` only changes what it shows: Done stays disabled and nothing is saved. Typing the name lets
+    the field capitalise and autocorrect it. So the value goes in with a trailing space, then one Delete key is posted to Messages'
+    process (`CGEventPostToPid`, no System Events), and the field must then read exactly the new name with Done enabled.
+  - Cancel after an edit raises a "Discard Changes" alert on the sheet, which has to be answered too.
+  - Conversation-menu identifiers change when Messages is frontmost (`show_details` vs `toggleDetailsFromConversationsMenu`), so
+    menu bar items are matched by title.
+  - Group photo: the sheet's "Open Gallery" opens a popover picker of the Photos library (`PXPicker…`), with no way to choose a
+    file by path, so changing the photo isn't offered. While that popover is up the sheet's Cancel can't be reached.
 - Releases: bump `version` in `package.json`, `manifest.json` and the `Server` constructor in `server.js`, then push a `vX.Y.Z` tag.
   GitHub Actions builds `imessage-mcp.mcpb` and attaches it to the release.
 - chat.db facts that matter:
