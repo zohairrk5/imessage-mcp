@@ -1975,7 +1975,7 @@ const TOOLS = [
 ];
 
 const server = new Server(
-  { name: "imessage-mcp", version: "1.4.0" },
+  { name: "imessage-mcp", version: "1.4.1" },
   {
     capabilities: { tools: {} },
     instructions:

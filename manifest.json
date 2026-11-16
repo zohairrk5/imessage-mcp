@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "imessage-mcp",
   "display_name": "iMessage MCP",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Slack-style context over your iMessages: conversations, group chats, full-text search, photos, files and real contact names.",
   "long_description": "Gives Claude useful access to your Messages history on macOS. List conversations by activity, read DMs and group chats by contact or group name, search every message, browse, read and save the photos, PDFs and documents people send, see unread messages grouped by conversation, and send to a resolved person or group, now or at a scheduled time, or leave a draft in the chat for you to send yourself. Senders are shown by contact name, and Claude can add contacts or update their names, numbers and emails in the Contacts app. Messages are read locally and read-only from your Mac; nothing is uploaded. Requires Full Disk Access for Claude (System Settings > Privacy & Security > Full Disk Access), and access to Contacts the first time you add or edit a contact. Not affiliated with Apple.",
   "author": {
