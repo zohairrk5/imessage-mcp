@@ -73,9 +73,15 @@ Quit and reopen the app afterwards. Check it with `node ~/.imessage-mcp/bin/setu
 
 ### Drafts
 
-`draft_imessage` opens the chat through the `sms:` link Messages registers on every Mac, with the text filled in. It needs no
-extra permission and can't send anything: nothing presses Return for you. If that chat already had unsent text in its compose box,
-the draft replaces it.
+`draft_imessage` opens the chat through the `sms:` link Messages registers on every Mac, with the text filled in. It can't send
+anything: nothing presses Return for you. If that chat already had unsent text in its compose box, the draft replaces it.
+
+Group chats need care, because when Messages can't find the group behind the link it opens a New Message window (addressed to your
+own Apple ID) with the draft in it instead. So for a group, `draft_imessage` first opens the chat without the text, reads the title
+of Messages' window, and only adds the text once the window shows that group; otherwise it stops and drafts nothing. Reading the
+window title needs the same permission to control Messages that sending uses (System Settings > Privacy & Security > Automation).
+Without it the draft still goes in, and the reply says to check which chat is open before pressing Return. A group
+with no messages left on this Mac (all deleted or expired) can't be opened from outside Messages at all, so it's refused.
 
 ### Editing contacts
 

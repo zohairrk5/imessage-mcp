@@ -774,25 +774,94 @@ async function sendMessage({ recipient, message }) {
   return r.conv ? `Sent to ${r.label}.` : `Sent to ${r.label}, new conversation via iMessage.`;
 }
 
+// The title of Messages' front window ("" with none open), from Messages' own scripting, or null when
+// it can't be read: that needs the same "control Messages" Automation permission as sending, and the
+// first call can wait on macOS's prompt for it, so it gives up after 5 seconds. (System Events'
+// view of the window needs Accessibility too, and sees no windows at all while the screen is locked.)
+async function messagesWindowTitle() {
+  try {
+    const { stdout } = await execFileAsync("/usr/bin/osascript", ["-e",
+      'tell application "Messages" to if (count of (windows whose visible is true)) > 0 then return name of first window whose visible is true'], { timeout: 5000 });
+    return stdout.trim();
+  } catch {
+    return null;
+  }
+}
+
+// Whether a window title is the group's conversation. A named group's window carries its name; an
+// unnamed one's is the members' first names joined with "&" ("Saad & Abrahim", "Ann, Bob & 2 more").
+// What Messages shows when it can't find the group is a New Message window titled with an address.
+function titleShowsGroup(title, conv) {
+  const name = String(conv.displayName || "").trim();
+  return name ? title.trim() === name : title.includes(" & ") && !isHandleLike(title);
+}
+
+// Whether a chat still has a message in chat.db, not just "left the group" or rename rows.
+function hasMessages(chatId) {
+  return Boolean(db().prepare(`SELECT 1 FROM chat_message_join cmj JOIN message m ON m.ROWID = cmj.message_id
+    WHERE cmj.chat_id = ? AND m.item_type = 0 LIMIT 1`).get(chatId));
+}
+
+const DRAFT_DEPS = {
+  resolve: resolveRecipient, hasMessages, title: messagesWindowTitle,
+  open: url => execFileAsync("/usr/bin/open", [url]), sleep: ms => new Promise(r => setTimeout(r, ms)),
+};
+
+// Wait up to ~3 seconds for Messages' front window to show the group; returns the last title read.
+async function waitForGroupWindow(conv, deps) {
+  let title;
+  for (let i = 0; i < 12; i++) {
+    await deps.sleep(250);
+    title = await deps.title();
+    if (title === null || titleShowsGroup(title, conv)) return title;
+  }
+  return title;
+}
+
 // Puts the text in the compose box of the right chat in Messages without sending it, through the
-// sms: URL scheme Messages registers. Opening a URL needs no Automation or Accessibility permission,
-// and nothing here can press Return: the person reads the draft in Messages and sends it themselves.
-// Messages replaces whatever was already in that chat's compose box; an empty body doesn't clear it.
-async function draftMessage({ recipient, message }) {
-  const r = resolveRecipient(recipient, message);
+// sms: URL scheme Messages registers. Nothing here can press Return: the person reads the draft in
+// Messages and sends it themselves. Messages replaces whatever was already in that chat's compose
+// box; an empty body doesn't clear it.
+//
+// A group is opened by `sms://open?groupid=`, which Messages only honours for a group it still lists.
+// For one it doesn't (every message deleted or expired, so chat.db keeps only a "left" row), it
+// opens a New Message window addressed to your own Apple ID instead, with the draft in it, and the
+// person could send it there trusting it went to the group. So a group with no messages left is
+// refused, and when Messages' window title can be read, the group is opened without the text first
+// and the text goes in only once the window shows that group.
+async function draftMessage({ recipient, message }, deps = DRAFT_DEPS) {
+  const r = deps.resolve(recipient, message);
   const chat = r.conv?.chats[0];
-  let url;
-  if (r.conv?.isGroup) {
-    if (!chat.gid) throw new Error(`Can't open ${r.label} from outside Messages (it has no group id). Nothing was drafted.`);
-    url = `sms://open?groupid=${encodeURIComponent(chat.gid)}&body=${encodeURIComponent(r.text)}`;
-  } else {
+  if (!r.conv?.isGroup) {
     const handle = r.conv ? chat.ident || [...r.conv.handles][0] : r.handle;
     if (!handle) throw new Error(`Can't open ${r.label} from outside Messages (no phone number or email on it). Nothing was drafted.`);
-    url = `sms:${handle}&body=${encodeURIComponent(r.text)}`;
+    await deps.open(`sms:${handle}&body=${encodeURIComponent(r.text)}`);
+    return `Draft placed in the compose box of ${r.label} in Messages, which is now open on that chat. Nothing was sent. ` +
+      "Tell the person to check or edit it there and press Return to send it. " +
+      "If that chat's compose box already held unsent text, the draft replaced it.";
   }
-  await execFileAsync("/usr/bin/open", [url]);
-  return `Draft placed in the compose box of ${r.label} in Messages, which is now open on that chat. Nothing was sent. ` +
-    "Tell the person to check or edit it there and press Return to send it. " +
+
+  if (!chat.gid) throw new Error(`Can't open ${r.label} from outside Messages (it has no group id). Nothing was drafted.`);
+  if (!deps.hasMessages(chat.id)) {
+    throw new Error(`Messages can't open ${r.label} from outside the app: no messages are left in it (deleted or expired), ` +
+      "and for such a group Messages opens a New Message window instead. Nothing was drafted. " +
+      "Tell the person to open the group in Messages and type the message there.");
+  }
+  const url = `sms://open?groupid=${encodeURIComponent(chat.gid)}`;
+  await deps.open(url);
+  const title = await waitForGroupWindow(r.conv, deps);
+  if (title !== null && !titleShowsGroup(title, r.conv)) {
+    throw new Error(`Messages opened ${title ? `"${title}"` : "no window"} instead of ${r.label}, so nothing was drafted. ` +
+      "Tell the person to open the group in Messages and type the message there.");
+  }
+  await deps.open(`${url}&body=${encodeURIComponent(r.text)}`);
+  if (title === null) {
+    return `Draft placed in the compose box of ${r.label} in Messages. Nothing was sent. This server can't read Messages' window ` +
+      "(that needs permission to control Messages, the same as sending), so it couldn't confirm which chat opened: tell the person to check that the window " +
+      `shows ${r.conv.name} before pressing Return, and to delete the text if it's anywhere else.`;
+  }
+  return `Draft placed in the compose box of ${r.label} in Messages, which is now open on that chat (its window shows "${title}"). ` +
+    "Nothing was sent. Tell the person to check or edit it there and press Return to send it. " +
     "If that chat's compose box already held unsent text, the draft replaced it.";
 }
 
@@ -1858,7 +1927,7 @@ const TOOLS = [
   },
   {
     name: "draft_imessage",
-    description: "Write a message into the compose box of a person's or group chat's conversation in Messages.app WITHOUT sending it. Messages opens on that chat; the person reads it, edits it if they like, and presses Return to send. Use this when the person wants to approve messages in the chat themselves. Resolves recipients exactly like send_imessage. Replaces any unsent text already in that chat's compose box.",
+    description: "Write a message into the compose box of a person's or group chat's conversation in Messages.app WITHOUT sending it. Messages opens on that chat; the person reads it, edits it if they like, and presses Return to send. Use this when the person wants to approve messages in the chat themselves. Resolves recipients exactly like send_imessage. Replaces any unsent text already in that chat's compose box. For a group chat it checks that Messages' window shows that group before adding the text, and refuses rather than draft anywhere else; if the result says it couldn't confirm the chat, tell the person to check which chat is open before pressing Return.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1942,6 +2011,7 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
 // Exposed for test/ and bin/setup.js, which import this file with IMESSAGE_MCP_IMPORT=1.
 export { parseSendTime, fmtWhen, withQueue, addScheduled, cancelScheduled, readQueue, runDue, takeNotices, schedulerStatus, GRACE_MS };
 export { createContact, updateContact, resolveCard, findDuplicates, planUpdate, describeChange, contactsReply, contactsTimeout, contactsAccess, phoneKey };
+export { draftMessage, titleShowsGroup };
 
 if (process.env.IMESSAGE_MCP_IMPORT === "1") {
   // imported as a module: don't start anything

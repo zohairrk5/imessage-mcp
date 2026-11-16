@@ -11,7 +11,7 @@
   "scripts": {
     "setup": "node bin/setup.js",
     "check": "node bin/setup.js --check",
-    "test": "node test/scheduler.test.js && node test/contacts.test.js",
+    "test": "node test/scheduler.test.js && node test/contacts.test.js && node test/draft.test.js",
     "pack:mcpb": "npx -y @anthropic-ai/mcpb pack . imessage-mcp.mcpb"
   },
   "engines": {
