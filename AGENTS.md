@@ -46,6 +46,9 @@ Everything runs locally and reads the Messages database read-only.
 - Contact edits go through `CNContactStore` (JavaScript for Automation in `/usr/bin/osascript`, see `CONTACTS_JXA`), never by writing
   the AddressBook files. The card ids in those files (`ZUNIQUEID`, e.g. `…:ABPerson`) are the framework's contact identifiers.
 - Drafts open `sms:<handle>&body=…` (people) or `sms://open?groupid=<chat.group_id>&body=…` (groups); they never send.
+  Messages ignores the group link for a group it no longer lists (no messages left in chat.db) and opens a New Message
+  window to your own Apple ID instead, so group drafts open without the text first and check Messages' window title.
+  Never test drafts with the screen locked: System Events sees no windows then, so a test draft can't be read back or cleared.
 - Releases: bump `version` in `package.json`, `manifest.json` and the `Server` constructor in `server.js`, then push a `vX.Y.Z` tag.
   GitHub Actions builds `imessage-mcp.mcpb` and attaches it to the release.
 - chat.db facts that matter:
